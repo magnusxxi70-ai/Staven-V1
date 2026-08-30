@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
+import crypto from 'node:crypto';
 import { config } from './config.js';
 import { loadSessionState, getSessionState, registerSessionSubmission } from './session.js';
 import { protections, redact } from './security.js';
@@ -14,30 +15,55 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet());
 app.use(express.json({ limit: '64kb' }));
+app.use(express.urlencoded({ extended: false }));
 app.use(rateLimit({ windowMs: 60_000, limit: 120 }));
 
-function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  if (!header.startsWith('Basic ')) {
-    res.set('WWW-Authenticate', 'Basic realm="STAVEN BLUE V1"');
-    return res.status(401).send('Authentication required');
-  }
-  let decoded;
-  try {
-    decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
-  } catch {
-    return res.status(401).end();
-  }
-  const i = decoded.indexOf(':');
-  if (i < 0) return res.status(401).end();
-  const user = decoded.slice(0, i);
-  const pass = decoded.slice(i + 1);
-  if (user !== config.dashboardUser || pass !== config.dashboardPassword) {
-    res.set('WWW-Authenticate', 'Basic realm="STAVEN BLUE V1"');
-    return res.status(401).end();
-  }
-  next();
+/* ── Token-based session auth ────────────────────────────── */
+const TOKEN_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+const activeTokens = new Map(); // token -> expiresAt
+
+function generateToken() {
+  const token = crypto.randomUUID();
+  activeTokens.set(token, Date.now() + TOKEN_TTL);
+  return token;
 }
+
+function isValidToken(token) {
+  if (!token) return false;
+  const expiresAt = activeTokens.get(token);
+  if (!expiresAt) return false;
+  if (Date.now() > expiresAt) {
+    activeTokens.delete(token);
+    return false;
+  }
+  return true;
+}
+
+// Periodic cleanup of expired tokens
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, expiresAt] of activeTokens) {
+    if (now > expiresAt) activeTokens.delete(token);
+  }
+}, 60 * 60 * 1000);
+
+function parseCookies(req) {
+  const cookies = {};
+  const raw = req.headers.cookie || '';
+  for (const pair of raw.split(';')) {
+    const [key, ...rest] = pair.trim().split('=');
+    if (key) cookies[key.trim()] = rest.join('=').trim();
+  }
+  return cookies;
+}
+
+function requireAuth(req, res, next) {
+  const cookies = parseCookies(req);
+  if (isValidToken(cookies['staven_token'])) return next();
+  return res.redirect('/login');
+}
+
+/* ── Public routes ───────────────────────────────────────── */
 
 app.get('/health', (_req, res) => res.json({
   ok: true,
@@ -45,20 +71,110 @@ app.get('/health', (_req, res) => res.json({
   uptime: process.uptime()
 }));
 
-app.get('/api/health', auth, (_req, res) => res.json({
+// Login page (HTML form)
+app.get('/login', (_req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STAVEN BLUE V1 — Login</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#090b10;color:#eef1f6;font-family:Inter,system-ui,-apple-system,sans-serif}
+.login-box{background:#131720;border:1px solid #252b38;border-radius:18px;padding:40px;width:100%;max-width:380px;box-shadow:0 10px 35px #0003}
+h1{font-size:22px;margin-bottom:4px}
+.subtitle{color:#929caf;margin-bottom:28px;font-size:14px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:13px;color:#929caf;margin-bottom:6px}
+.field input{width:100%;padding:11px 14px;border:1px solid #252b38;border-radius:11px;background:#0e1017;color:#eef1f6;font-size:15px;outline:none;transition:border-color .2s}
+.field input:focus{border-color:#4f7cff}
+button{width:100%;padding:12px;border:0;border-radius:11px;background:#4f7cff;color:#fff;font-weight:700;font-size:15px;cursor:pointer;transition:background .2s}
+button:hover{background:#3d6ae0}
+.error{color:#ff6b6b;font-size:13px;margin-bottom:14px;display:none}
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>STAVEN BLUE V1</h1>
+  <div class="subtitle">Control Center Login</div>
+  <div class="error" id="err">Invalid username or password</div>
+  <form method="POST" action="/login">
+    <div class="field">
+      <label for="u">Username</label>
+      <input type="text" id="u" name="username" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+      <label for="p">Password</label>
+      <input type="password" id="p" name="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit">Sign In</button>
+  </form>
+</div>
+<script>
+if(new URLSearchParams(location.search).get('error')==='1')document.getElementById('err').style.display='block';
+</script>
+</body>
+</html>`);
+});
+
+// Handle login form submission
+app.post('/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (username === config.dashboardUser && password === config.dashboardPassword) {
+    const token = generateToken();
+    res.setHeader('Set-Cookie', `staven_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${TOKEN_TTL / 1000}`);
+    return res.redirect('/');
+  }
+  return res.redirect('/login?error=1');
+});
+
+// Logout
+app.get('/logout', (_req, res) => {
+  res.setHeader('Set-Cookie', 'staven_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  return res.redirect('/login');
+});
+
+/* ── Protected API routes (accept cookie OR Basic Auth for JS client) ── */
+function apiAuth(req, res, next) {
+  // Check cookie
+  const cookies = parseCookies(req);
+  if (isValidToken(cookies['staven_token'])) return next();
+
+  // Fallback: Basic Auth header (used by dashboard JS fetch calls)
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Basic ')) {
+    let decoded;
+    try {
+      decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    } catch {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const i = decoded.indexOf(':');
+    if (i < 0) return res.status(401).json({ error: 'unauthorized' });
+    const user = decoded.slice(0, i);
+    const pass = decoded.slice(i + 1);
+    if (user === config.dashboardUser && pass === config.dashboardPassword) return next();
+  }
+
+  return res.status(401).json({ error: 'unauthorized' });
+}
+
+app.get('/api/health', apiAuth, (_req, res) => res.json({
   ok: true,
   name: 'STAVEN BLUE V1',
   uptime: process.uptime()
 }));
 
-app.get('/api/session', auth, (_req, res) => res.json(getSessionState()));
+app.get('/api/session', apiAuth, (_req, res) => res.json(getSessionState()));
 
-app.post('/api/session/register', auth, async (_req, res) => {
+app.post('/api/session/register', apiAuth, async (_req, res) => {
   const result = await registerSessionSubmission();
   res.json({ ok: true, state: result });
 });
 
-app.get('/', auth, (_req, res) => {
+/* ── Dashboard (protected by cookie) ────────────────────── */
+app.get('/', requireAuth, (_req, res) => {
   const protectionText = JSON.stringify(protections.map(x => '✓ ' + x).join('\n'));
   const user = JSON.stringify(config.dashboardUser);
   const pass = JSON.stringify(config.dashboardPassword);
@@ -77,10 +193,14 @@ h1{margin:0;font-size:34px}.muted{color:#929caf}.grid{display:grid;grid-template
 .v{font-size:27px;font-weight:750;margin-top:8px}.pill{display:inline-block;padding:7px 10px;border-radius:999px;background:#1c2430}
 button{padding:11px 15px;border:0;border-radius:11px;font-weight:700;cursor:pointer}
 pre{white-space:pre-wrap;line-height:1.65}.status{margin-top:12px}
+.btn-secondary{background:#252b38;color:#eef1f6}.btn-secondary:hover{background:#353d4e}
+.top-right{display:flex;gap:10px;align-items:center}
 </style>
 </head>
 <body><main>
-<div class="top"><div><h1>STAVEN BLUE V1</h1><div class="muted">Control Center</div></div><button onclick="refresh()">Refresh</button></div>
+<div class="top"><div><h1>STAVEN BLUE V1</h1><div class="muted">Control Center</div></div>
+<div class="top-right"><button class="btn-secondary" onclick="location.href='/logout'">Logout</button><button onclick="refresh()">Refresh</button></div>
+</div>
 <div class="grid">
 <div class="card"><div class="muted">Bot</div><div class="v">Online</div></div>
 <div class="card"><div class="muted">Uptime</div><div class="v" id="uptime">—</div></div>
@@ -111,6 +231,8 @@ setInterval(refresh,15000);
 </script>
 </body></html>`);
 });
+
+/* ── Start ───────────────────────────────────────────────── */
 
 await loadSessionState();
 
