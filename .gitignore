@@ -6,3 +6,6 @@ logs/
 session/
 appstate/
 cookies/
+fca-config.json
+Fca_Database/
+package-lock.json
