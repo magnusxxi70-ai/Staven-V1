@@ -4,7 +4,14 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import crypto from 'node:crypto';
 import { config } from './config.js';
-import { loadSessionState, getSessionState, registerSessionSubmission } from './session.js';
+import {
+  loadSessionState,
+  getSessionState,
+  registerSessionSubmission,
+  replaceSession,
+  removeSession,
+  checkSession,
+} from './session.js';
 import { protections, redact } from './security.js';
 
 process.on('uncaughtException', e => console.error('[STAVEN BLUE V1]', redact(e?.message || e)));
@@ -39,7 +46,6 @@ function isValidToken(token) {
   return true;
 }
 
-// Periodic cleanup of expired tokens
 setInterval(() => {
   const now = Date.now();
   for (const [token, expiresAt] of activeTokens) {
@@ -71,7 +77,6 @@ app.get('/health', (_req, res) => res.json({
   uptime: process.uptime()
 }));
 
-// Login page (HTML form)
 app.get('/login', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <html lang="en">
@@ -118,7 +123,6 @@ if(new URLSearchParams(location.search).get('error')==='1')document.getElementBy
 </html>`);
 });
 
-// Handle login form submission
 app.post('/login', (req, res) => {
   const { username, password } = req.body || {};
   if (username === config.dashboardUser && password === config.dashboardPassword) {
@@ -129,19 +133,16 @@ app.post('/login', (req, res) => {
   return res.redirect('/login?error=1');
 });
 
-// Logout
 app.get('/logout', (_req, res) => {
   res.setHeader('Set-Cookie', 'staven_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
   return res.redirect('/login');
 });
 
-/* ── Protected API routes (accept cookie OR Basic Auth for JS client) ── */
+/* ── Protected API routes ────────────────────────────────── */
 function apiAuth(req, res, next) {
-  // Check cookie
   const cookies = parseCookies(req);
   if (isValidToken(cookies['staven_token'])) return next();
 
-  // Fallback: Basic Auth header (used by dashboard JS fetch calls)
   const header = req.headers.authorization || '';
   if (header.startsWith('Basic ')) {
     let decoded;
@@ -166,18 +167,62 @@ app.get('/api/health', apiAuth, (_req, res) => res.json({
   uptime: process.uptime()
 }));
 
-app.get('/api/session', apiAuth, (_req, res) => res.json(getSessionState()));
+app.get('/api/session', apiAuth, (_req, res) => {
+  const state = getSessionState();
+  // Mask sensitive fields before sending to frontend
+  const safe = { ...state };
+  delete safe.appstateExists;
+  res.json(safe);
+});
 
 app.post('/api/session/register', apiAuth, async (_req, res) => {
-  const result = await registerSessionSubmission();
-  res.json({ ok: true, state: result });
+  try {
+    const result = await registerSessionSubmission();
+    const safe = { ...result };
+    delete safe.appstateExists;
+    res.json({ ok: true, state: safe });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Failed to register session' });
+  }
+});
+
+app.post('/api/session/replace', apiAuth, async (_req, res) => {
+  try {
+    const result = await replaceSession();
+    const safe = { ...result };
+    delete safe.appstateExists;
+    res.json({ ok: true, state: safe });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Failed to replace session' });
+  }
+});
+
+app.post('/api/session/remove', apiAuth, async (_req, res) => {
+  try {
+    const result = await removeSession();
+    const safe = { ...result };
+    delete safe.appstateExists;
+    res.json({ ok: true, state: safe });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Failed to remove session' });
+  }
+});
+
+app.post('/api/session/check', apiAuth, async (_req, res) => {
+  try {
+    const result = await checkSession();
+    const safe = { ...result };
+    delete safe.appstateExists;
+    res.json({ ok: true, state: safe });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Failed to check session' });
+  }
 });
 
 /* ── Dashboard (protected by cookie) ────────────────────── */
 app.get('/', requireAuth, (_req, res) => {
-  const protectionText = JSON.stringify(protections.map(x => '✓ ' + x).join('\n'));
-  const user = JSON.stringify(config.dashboardUser);
-  const pass = JSON.stringify(config.dashboardPassword);
+  const protectionText = JSON.stringify(protections.map(x => '✓ ' + x).join('\\n'));
+  const authB64 = Buffer.from(config.dashboardUser + ':' + config.dashboardPassword).toString('base64');
 
   res.type('html').send(`<!doctype html>
 <html lang="en">
@@ -186,45 +231,133 @@ app.get('/', requireAuth, (_req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>STAVEN BLUE V1 Control Center</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#090b10;color:#eef1f6;font-family:Inter,system-ui,-apple-system,sans-serif}
-main{max-width:1100px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
-h1{margin:0;font-size:34px}.muted{color:#929caf}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px}
+*{box-sizing:border-box}
+body{margin:0;background:#090b10;color:#eef1f6;font-family:Inter,system-ui,-apple-system,sans-serif}
+main{max-width:1100px;margin:auto;padding:28px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+h1{margin:0;font-size:34px}
+h2{margin:0 0 16px;font-size:20px;color:#eef1f6}
+.muted{color:#929caf}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px}
 .card{background:#131720;border:1px solid #252b38;border-radius:18px;padding:20px;box-shadow:0 10px 35px #0003}
-.v{font-size:27px;font-weight:750;margin-top:8px}.pill{display:inline-block;padding:7px 10px;border-radius:999px;background:#1c2430}
+.v{font-size:27px;font-weight:750;margin-top:8px}
+.pill{display:inline-block;padding:7px 10px;border-radius:999px;background:#1c2430}
 button{padding:11px 15px;border:0;border-radius:11px;font-weight:700;cursor:pointer}
-pre{white-space:pre-wrap;line-height:1.65}.status{margin-top:12px}
-.btn-secondary{background:#252b38;color:#eef1f6}.btn-secondary:hover{background:#353d4e}
+pre{white-space:pre-wrap;line-height:1.65}
+.status{margin-top:12px}
+.btn-secondary{background:#252b38;color:#eef1f6}
+.btn-secondary:hover{background:#353d4e}
 .top-right{display:flex;gap:10px;align-items:center}
+.btn-sm{padding:7px 14px;font-size:13px}
+.btn-green{background:#16a34a;color:#fff}.btn-green:hover{background:#15803d}
+.btn-blue{background:#2563eb;color:#fff}.btn-blue:hover{background:#1d4ed8}
+.btn-orange{background:#d97706;color:#fff}.btn-orange:hover{background:#b45309}
+.btn-red{background:#dc2626;color:#fff}.btn-red:hover{background:#b91c1c}
+.session-info{display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;font-size:14px}
+.session-info .lbl{color:#929caf}
+.session-info .val{color:#eef1f6;font-weight:600}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px;padding-top:16px;border-top:1px solid #252b38}
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:11px;font-weight:600;font-size:14px;z-index:9999;display:none;box-shadow:0 4px 15px #0005}
+.toast-ok{background:#16a34a;color:#fff}
+.toast-err{background:#dc2626;color:#fff}
 </style>
 </head>
 <body><main>
 <div class="top"><div><h1>STAVEN BLUE V1</h1><div class="muted">Control Center</div></div>
 <div class="top-right"><button class="btn-secondary" onclick="location.href='/logout'">Logout</button><button onclick="refresh()">Refresh</button></div>
 </div>
-<div class="grid">
-<div class="card"><div class="muted">Bot</div><div class="v">Online</div></div>
-<div class="card"><div class="muted">Uptime</div><div class="v" id="uptime">—</div></div>
-<div class="card"><div class="muted">Session</div><div class="v" id="session">—</div></div>
-<div class="card"><div class="muted">Session</div><button onclick="register()">Register session state</button><div class="muted status" id="msg"></div></div>
+
+<div class="grid" id="cards">
+<div class="card"><div class="muted">Bot</div><div class="v" id="bot-status">Online</div></div>
+<div class="card"><div class="muted">Uptime</div><div class="v" id="uptime">\u2014</div></div>
+<div class="card"><div class="muted">Session</div><div class="v" id="session">\u2014</div></div>
 </div>
+
+<div class="card" style="margin-top:16px">
+<h2>Session Management</h2>
+<div class="session-info">
+<div><span class="lbl">Status: </span><span class="val" id="sm-status">\u2014</span></div>
+<div><span class="lbl">State: </span><span class="val" id="sm-state">\u2014</span></div>
+<div><span class="lbl">Last Check: </span><span class="val" id="sm-last-check">\u2014</span></div>
+<div><span class="lbl">Last Failed: </span><span class="val" id="sm-last-fail">\u2014</span></div>
+<div><span class="lbl">Created: </span><span class="val" id="sm-created">\u2014</span></div>
+<div><span class="lbl">Reference: </span><span class="val" id="sm-ref">\u2014</span></div>
+</div>
+<div class="actions">
+<button class="btn-sm btn-green" onclick="smAction('register')">Register Session</button>
+<button class="btn-sm btn-blue" onclick="smAction('replace')">Replace Session</button>
+<button class="btn-sm btn-red" onclick="smAction('remove')">Remove Session</button>
+<button class="btn-sm btn-orange" onclick="smAction('check')">Check Session</button>
+</div>
+<div class="muted status" id="sm-msg"></div>
+</div>
+
 <div class="card" style="margin-top:16px"><h2>Security</h2><pre id="security"></pre></div>
 </main>
+
+<div class="toast" id="toast"></div>
+
 <script>
-const auth='Basic '+btoa(${user}+':'+${pass});
+const auth='Basic '+btoa('${authB64}');
+const H={Authorization:auth,'Content-Type':'application/json'};
+const MSGS={not_configured:'Not Configured',configured:'Ready',submitted:'Submitted',connected:'Connected',error:'Error'};
+
+function showToast(msg,ok){
+  var t=document.getElementById('toast');
+  t.textContent=msg;
+  t.className='toast '+(ok?'toast-ok':'toast-err');
+  t.style.display='block';
+  setTimeout(function(){t.style.display='none'},3000);
+}
+
+function fmt(iso){
+  if(!iso)return'\u2014';
+  try{return new Date(iso).toLocaleString()}catch{return iso}
+}
+
+function updateSessionCards(s){
+  document.getElementById('sm-status').textContent=MSGS[s.status]||s.status||'\u2014';
+  document.getElementById('sm-state').textContent=s.configured?'Configured':'Not Configured';
+  document.getElementById('sm-last-check').textContent=fmt(s.lastCheck);
+  document.getElementById('sm-last-fail').textContent=fmt(s.lastFailedCheck);
+  document.getElementById('sm-created').textContent=fmt(s.createdAt);
+  document.getElementById('sm-ref').textContent=s.sessionRef||'\u2014';
+  document.getElementById('session').textContent=MSGS[s.status]||s.status||'\u2014';
+}
+
 async function refresh(){
-  const h={Authorization:auth};
-  const a=await fetch('/api/health',{headers:h});
-  const s=await fetch('/api/session',{headers:h});
-  if(!a.ok||!s.ok){location.reload();return}
-  const aj=await a.json(), sj=await s.json();
-  document.getElementById('uptime').textContent=Math.floor(aj.uptime)+'s';
-  document.getElementById('session').textContent=sj.status;
+  try{
+    var a=await fetch('/api/health',{headers:H});
+    var s=await fetch('/api/session',{headers:H});
+    if(!a.ok||!s.ok){location.reload();return}
+    var aj=await a.json(),sj=await s.json();
+    document.getElementById('uptime').textContent=Math.floor(aj.uptime)+'s';
+    updateSessionCards(sj);
+  }catch(e){
+    document.getElementById('sm-msg').textContent='Refresh failed';
+  }
 }
-async function register(){
-  const r=await fetch('/api/session/register',{method:'POST',headers:{Authorization:auth,'Content-Type':'application/json'},body:'{}'});
-  document.getElementById('msg').textContent=r.ok?'Saved':'Failed';
-  refresh();
+
+async function smAction(action){
+  var el=document.getElementById('sm-msg');
+  el.textContent='Processing...';
+  try{
+    var r=await fetch('/api/session/'+action,{method:'POST',headers:H});
+    var j=await r.json();
+    if(j.ok){
+      showToast(action.charAt(0).toUpperCase()+action.slice(1)+' successful',true);
+      updateSessionCards(j.state);
+      el.textContent='';
+    }else{
+      showToast(j.error||'Operation failed',false);
+      el.textContent=j.error||'Failed';
+    }
+  }catch(e){
+    showToast('Network error',false);
+    el.textContent='Network error';
+  }
 }
+
 document.getElementById('security').textContent=${protectionText};
 refresh();
 setInterval(refresh,15000);
