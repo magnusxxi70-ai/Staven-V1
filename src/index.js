@@ -20,7 +20,7 @@ process.on('unhandledRejection', e => console.error('[STAVEN BLUE V1]', redact(e
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(express.json({ limit: '64kb' }));
 app.use(express.urlencoded({ extended: false }));
 app.use(rateLimit({ windowMs: 60_000, limit: 120 }));
@@ -289,7 +289,7 @@ pre{white-space:pre-wrap;line-height:1.65}
 <div class="toast" id="toast"></div>
 
 <script>
-var auth='Basic '+btoa('${authB64}');
+var auth='Basic ${authB64}';
 var H={Authorization:auth,'Content-Type':'application/json'};
 var BOT_DOT={connecting:'dot-yellow',connected:'dot-green',disconnected:'dot-gray',error:'dot-red'};
 var BOT_LABEL={connecting:'Connecting',connected:'Connected',disconnected:'Offline',error:'Error'};
