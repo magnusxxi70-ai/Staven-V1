@@ -16,11 +16,62 @@ const state = {
   sessionRef: null,
 };
 
+/* ── Refresh stats (persisted) ────────────────────────── */
+const refreshStats = {
+  successfulRefreshes: 0,
+  failedRefreshes: 0,
+  totalAttempts: 0,
+  lastSuccessfulRefresh: null,
+  lastFailedRefresh: null,
+  nextAutomaticRefresh: null,
+};
+
+/* ── Auto-refresh timer ───────────────────────────────── */
+let refreshTimer = null;
+let refreshLock = false; // prevent concurrent refreshes
+
+const DEFAULT_REFRESH_INTERVAL = 90 * 60 * 1000; // 90 minutes
+function getRefreshInterval() {
+  const env = process.env.SESSION_REFRESH_INTERVAL_MS;
+  if (env) {
+    const ms = Number(env);
+    if (ms >= 60_000 && ms <= 7_200_000) return ms; // 1min to 2hr
+  }
+  return DEFAULT_REFRESH_INTERVAL;
+}
+
+function scheduleNextRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  const interval = getRefreshInterval();
+  refreshStats.nextAutomaticRefresh = new Date(Date.now() + interval).toISOString();
+  refreshTimer = setTimeout(async () => {
+    await performRefresh('automatic');
+    scheduleNextRefresh();
+  }, interval);
+  // Prevent timer from keeping the process alive
+  if (refreshTimer.unref) refreshTimer.unref();
+}
+
+function stopRefreshTimer() {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+  refreshStats.nextAutomaticRefresh = null;
+}
+
 /* ── Persistence ────────────────────────────────────────── */
 
 export async function loadSessionState() {
   try {
-    Object.assign(state, JSON.parse(await fs.readFile(STATE_FILE, 'utf8')));
+    const saved = JSON.parse(await fs.readFile(STATE_FILE, 'utf8'));
+    // Restore refresh stats if present
+    if (saved.refreshStats) {
+      Object.assign(refreshStats, saved.refreshStats);
+    }
+    // Restore core state (without refreshStats key)
+    const { refreshStats: _, ...coreState } = saved;
+    Object.assign(state, coreState);
   } catch { /* no saved state yet */ }
 
   // Try to auto-start bot if appstate exists on disk
@@ -29,6 +80,7 @@ export async function loadSessionState() {
       const appState = await loadAppstateFromDisk();
       if (appState && appState.length > 0) {
         await startBot(appState);
+        scheduleNextRefresh();
       }
     } catch (e) {
       console.error('[SESSION] Auto-start bot failed:', e?.message);
@@ -41,7 +93,10 @@ export async function loadSessionState() {
 
 async function saveState() {
   await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
-  await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2));
+  await fs.writeFile(STATE_FILE, JSON.stringify({
+    ...state,
+    refreshStats,
+  }, null, 2));
   return { ...state };
 }
 
@@ -53,6 +108,24 @@ export function getSessionState() {
     lastConnected: bot.lastConnected,
     lastDisconnected: bot.lastDisconnected,
     lastBotError: bot.lastError,
+  };
+}
+
+export function getRefreshStats() {
+  const bot = getBotState();
+  let sessionStatus = 'Disconnected';
+  if (bot.status === 'connected') sessionStatus = 'Connected';
+  else if (bot.status === 'connecting') sessionStatus = 'Connecting';
+  else if (bot.status === 'error') sessionStatus = 'Re-authentication Required';
+
+  // Check if session is stale (no successful refresh in a while)
+  if (state.status === 'error') sessionStatus = 'Re-authentication Required';
+
+  return {
+    ...refreshStats,
+    currentSessionStatus: sessionStatus,
+    refreshInterval: getRefreshInterval(),
+    nextAutomaticRefresh: refreshStats.nextAutomaticRefresh,
   };
 }
 
@@ -146,6 +219,8 @@ export async function registerSession(appStateInput) {
   try {
     await startBot(parsed);
     state.status = 'connected';
+    // Start auto-refresh after successful connection
+    scheduleNextRefresh();
   } catch (e) {
     state.status = 'error';
     state.lastFailedCheck = new Date().toISOString();
@@ -179,6 +254,7 @@ export async function replaceSession(appStateInput) {
   try {
     await startBot(parsed);
     state.status = 'connected';
+    scheduleNextRefresh();
   } catch (e) {
     state.status = 'error';
     state.lastFailedCheck = new Date().toISOString();
@@ -192,6 +268,7 @@ export async function replaceSession(appStateInput) {
 export async function removeSession() {
   await stopBot();
   await deleteAppstate();
+  stopRefreshTimer();
 
   state.configured = false;
   state.status = 'not_configured';
@@ -201,6 +278,15 @@ export async function removeSession() {
   state.createdAt = null;
   state.sessionRef = null;
   state.error = null;
+
+  // Reset refresh stats
+  refreshStats.successfulRefreshes = 0;
+  refreshStats.failedRefreshes = 0;
+  refreshStats.totalAttempts = 0;
+  refreshStats.lastSuccessfulRefresh = null;
+  refreshStats.lastFailedRefresh = null;
+  refreshStats.nextAutomaticRefresh = null;
+
   await saveState();
   return { ...state };
 }
@@ -247,4 +333,86 @@ export async function checkSession() {
 
   await saveState();
   return { ...state };
+}
+
+/* ── Session Refresh ────────────────────────────────────── */
+
+async function performRefresh(trigger) {
+  // Prevent concurrent refreshes
+  if (refreshLock) {
+    console.log(`[SESSION] Refresh skipped — another ${trigger} refresh is already running`);
+    return null;
+  }
+
+  // Only refresh if session is configured
+  if (!state.configured) {
+    console.log('[SESSION] Refresh skipped — no session configured');
+    return null;
+  }
+
+  const appState = await loadAppstateFromDisk();
+  if (!appState || (Array.isArray(appState) && appState.length === 0)) {
+    refreshStats.totalAttempts++;
+    refreshStats.failedRefreshes++;
+    refreshStats.lastFailedRefresh = new Date().toISOString();
+    state.status = 'error';
+    state.lastFailedCheck = new Date().toISOString();
+    state.error = 'No appstate data found on disk';
+    await saveState();
+    return { ...state };
+  }
+
+  refreshLock = true;
+  refreshStats.totalAttempts++;
+
+  try {
+    // Restart bot with existing appstate (the FCA library reconnects)
+    await startBot(appState);
+
+    // Refresh successful
+    refreshStats.successfulRefreshes++;
+    refreshStats.lastSuccessfulRefresh = new Date().toISOString();
+    state.status = 'connected';
+    state.lastCheck = new Date().toISOString();
+    state.lastFailedCheck = null;
+    state.error = null;
+    await saveState();
+    console.log(`[SESSION] ${trigger} refresh successful (#${refreshStats.successfulRefreshes})`);
+  } catch (e) {
+    refreshStats.failedRefreshes++;
+    refreshStats.lastFailedRefresh = new Date().toISOString();
+    state.status = 'error';
+    state.lastFailedCheck = new Date().toISOString();
+    state.error = e?.message || 'Refresh failed';
+    await saveState();
+    console.error(`[SESSION] ${trigger} refresh failed:`, e?.message || e);
+  } finally {
+    refreshLock = false;
+    state.updatedAt = new Date().toISOString();
+    await saveState();
+  }
+
+  return { ...state };
+}
+
+/**
+ * Manual refresh triggered by the user via "Refresh Now" button.
+ * Returns the result and prevents concurrent refreshes.
+ */
+export async function manualRefresh() {
+  return performRefresh('manual');
+}
+
+/**
+ * Check if a refresh is currently in progress.
+ */
+export function isRefreshInProgress() {
+  return refreshLock;
+}
+
+/**
+ * Clean up timers on shutdown.
+ */
+export function cleanupRefresh() {
+  stopRefreshTimer();
 }

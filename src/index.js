@@ -7,10 +7,13 @@ import { config } from './config.js';
 import {
   loadSessionState,
   getSessionState,
+  getRefreshStats,
   registerSession,
   replaceSession,
   removeSession,
   checkSession,
+  manualRefresh,
+  cleanupRefresh,
 } from './session.js';
 import { protections, redact } from './security.js';
 
@@ -193,6 +196,21 @@ app.post('/api/session/check', apiAuth, async (_req, res) => {
   }
 });
 
+app.get('/api/session/refresh-stats', apiAuth, (_req, res) => {
+  res.json(getRefreshStats());
+});
+
+app.post('/api/session/refresh', apiAuth, async (_req, res) => {
+  try {
+    const result = await manualRefresh();
+    if (!result) return res.json({ ok: false, error: 'Refresh already in progress or no session configured' });
+    if (result.error) return res.json({ ok: false, error: result.error });
+    res.json({ ok: true, state: result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Refresh failed' });
+  }
+});
+
 /* ── Dashboard (protected by cookie) ────────────────────── */
 app.get('/', requireAuth, (_req, res) => {
   const protectionText = JSON.stringify(protections.map(x => '\u2713 ' + x).join('\n'));
@@ -281,6 +299,25 @@ pre{white-space:pre-wrap;line-height:1.65}
 <button class="btn-sm btn-orange" id="btn-check" onclick="smAction('check')">Check Status</button>
 </div>
 <div class="muted status" id="sm-msg"></div>
+</div>
+
+<div class="card" style="margin-top:16px">
+<h2>Cookie / Session Refresh</h2>
+<div class="session-info" style="margin-bottom:16px">
+<div><span class="lbl">Successful Refreshes: </span><span class="val" id="rf-success">0</span></div>
+<div><span class="lbl">Failed Refreshes: </span><span class="val" id="rf-failed" style="color:#ef4444">0</span></div>
+<div><span class="lbl">Total Attempts: </span><span class="val" id="rf-total">0</span></div>
+<div><span class="lbl">Last Successful: </span><span class="val" id="rf-last-ok">\u2014</span></div>
+<div><span class="lbl">Last Failed: </span><span class="val" id="rf-last-fail">\u2014</span></div>
+<div><span class="lbl">Next Auto Refresh: </span><span class="val" id="rf-next">\u2014</span></div>
+<div><span class="lbl">Current Session: </span><span class="val" id="rf-status">\u2014</span></div>
+<div><span class="lbl">Refresh Interval: </span><span class="val" id="rf-interval">\u2014</span></div>
+</div>
+<div class="actions">
+<button class="btn-sm btn-green" id="btn-refresh" onclick="refreshSession()">Refresh Now</button>
+<button class="btn-sm btn-orange" id="btn-rf-check" onclick="smAction('check')">Check Session</button>
+</div>
+<div class="muted status" id="rf-msg"></div>
 </div>
 
 <div class="card" style="margin-top:16px"><h2>Security</h2><pre id="security"></pre></div>
@@ -376,8 +413,66 @@ async function smAction(action){
 }
 
 document.getElementById('security').textContent=${protectionText};
+function fmtMs(ms){
+  if(!ms)return'\u2014';
+  var m=Math.floor(ms/60000),s=Math.floor((ms%60000)/1000);
+  if(m>0)return m+' min '+s+' sec';
+  return s+' sec';
+}
+
+async function loadRefreshStats(){
+  try{
+    var r=await fetch('/api/session/refresh-stats',{headers:H});
+    if(!r.ok)return;
+    var j=await r.json();
+    document.getElementById('rf-success').textContent=j.successfulRefreshes||0;
+    document.getElementById('rf-failed').textContent=j.failedRefreshes||0;
+    document.getElementById('rf-total').textContent=j.totalAttempts||0;
+    document.getElementById('rf-last-ok').textContent=fmt(j.lastSuccessfulRefresh);
+    document.getElementById('rf-last-fail').textContent=fmt(j.lastFailedRefresh);
+    document.getElementById('rf-next').textContent=fmt(j.nextAutomaticRefresh);
+    document.getElementById('rf-interval').textContent=fmtMs(j.refreshInterval);
+    var ss=j.currentSessionStatus||'\u2014';
+    var sEl=document.getElementById('rf-status');
+    sEl.textContent=ss;
+    if(ss==='Connected')sEl.style.color='#22c55e';
+    else if(ss==='Re-authentication Required')sEl.style.color='#ef4444';
+    else if(ss==='Connecting')sEl.style.color='#eab308';
+    else sEl.style.color='#eef1f6';
+  }catch(e){}
+}
+
+async function refreshSession(){
+  var el=document.getElementById('rf-msg');
+  var btn=document.getElementById('btn-refresh');
+  btn.disabled=true;
+  btn.textContent='Refreshing...';
+  el.textContent='Performing refresh...';
+  try{
+    var r=await fetch('/api/session/refresh',{method:'POST',headers:H});
+    var j=await r.json();
+    if(j.ok){
+      showToast('Refresh successful',true);
+      el.textContent='';
+      updateUI(j.state);
+    }else{
+      showToast(j.error||'Refresh failed',false);
+      el.textContent=j.error||'Refresh failed';
+    }
+  }catch(e){
+    showToast('Network error',false);
+    el.textContent='Network error';
+  }finally{
+    btn.disabled=false;
+    btn.textContent='Refresh Now';
+    loadRefreshStats();
+  }
+}
+
 refresh();
+loadRefreshStats();
 setInterval(refresh,15000);
+setInterval(loadRefreshStats,15000);
 </script>
 </body></html>`);
 });
@@ -395,6 +490,7 @@ app.listen(port, host, () => {
 
 function shutdown(signal) {
   console.log(`[STAVEN BLUE V1] ${signal} received, shutting down`);
+  cleanupRefresh();
   process.exit(0);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
