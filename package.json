@@ -14,5 +14,8 @@
     "express-rate-limit": "^7.5.0",
     "gradient-string": "2.0.2",
     "helmet": "^8.1.0"
+  },
+  "overrides": {
+    "gradient-string": "2.0.2"
   }
 }
