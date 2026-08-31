@@ -2,7 +2,7 @@ const cooldowns = new Map();
 
 export function handleCommand(message) {
   const body = String(message?.body || '').trim();
-  if (!body.startsWith('/')) return null;
+  if (!body.startsWith('!')) return null;
 
   const [name] = body.slice(1).split(/\s+/);
   const key = `${message.senderID}:${name.toLowerCase()}`;
@@ -34,7 +34,7 @@ export function handleCommand(message) {
   }
 
   if (name.toLowerCase() === 'help') {
-    return { type: 'reply', text: '/ping\n/uptime\n/help' };
+    return { type: 'reply', text: '!ping\n!uptime\n!help' };
   }
 
   return { type: 'unknown' };
