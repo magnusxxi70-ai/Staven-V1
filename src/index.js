@@ -253,7 +253,11 @@ pre{white-space:pre-wrap;line-height:1.65}
 </div>
 
 <div class="card" style="margin-top:16px">
-<h2>Session Management</h2>
+<h2>Session / Authentication</h2>
+<div id="conn-banner" style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-radius:11px;margin-bottom:16px;font-weight:600;font-size:14px;background:#1a1f2e;border:1px solid #252b38">
+<span class="status-dot dot-gray" id="conn-dot"></span>
+<span id="conn-label">Disconnected</span>
+</div>
 <div class="session-info">
 <div><span class="lbl">Status: </span><span class="val" id="sm-status">\u2014</span></div>
 <div><span class="lbl">State: </span><span class="val" id="sm-state">\u2014</span></div>
@@ -265,15 +269,16 @@ pre{white-space:pre-wrap;line-height:1.65}
 </div>
 
 <div class="appstate-area">
-<label for="appstate-input">Appstate Data (JSON array or cookie string)</label>
-<textarea id="appstate-input" placeholder='Paste appstate here.\\nExample: [{"key":"c_user","value":"123456","domain":".facebook.com"}]\\nOr: c_user=123456; xs=abc123...'></textarea>
+<label for="appstate-input">Facebook Session Data</label>
+<div style="font-size:12px;color:#6b7280;margin-bottom:8px">Paste your appstate as a <b>JSON array</b> or <b>cookie string</b> (e.g. c_user=...; xs=...)</div>
+<textarea id="appstate-input" placeholder='[{"key":"c_user","value":"123456","domain":".facebook.com"},\n {"key":"xs","value":"abc123...","domain":".facebook.com"}]\n\nOr cookie string: c_user=123456; xs=abc123...'></textarea>
 </div>
 
 <div class="actions">
-<button class="btn-sm btn-green" id="btn-register" onclick="smAction('register')">Register Session</button>
+<button class="btn-sm btn-green" id="btn-register" onclick="smAction('register')">Connect</button>
 <button class="btn-sm btn-blue" id="btn-replace" onclick="smAction('replace')">Replace Session</button>
 <button class="btn-sm btn-red" id="btn-remove" onclick="smAction('remove')">Remove Session</button>
-<button class="btn-sm btn-orange" id="btn-check" onclick="smAction('check')">Check Session</button>
+<button class="btn-sm btn-orange" id="btn-check" onclick="smAction('check')">Check Status</button>
 </div>
 <div class="muted status" id="sm-msg"></div>
 </div>
@@ -307,6 +312,8 @@ function updateUI(s){
   document.getElementById('bot-status').innerHTML='<span class="status-dot '+(BOT_DOT[bs]||'dot-gray')+'"></span>'+(BOT_LABEL[bs]||bs);
   document.getElementById('uptime').textContent=Math.floor((s.uptime||0))+'s';
   document.getElementById('session').textContent=BOT_LABEL[bs]||s.status||'\u2014';
+  var cd=document.getElementById('conn-dot');var cl=document.getElementById('conn-label');
+  if(cd){cd.className='status-dot '+(BOT_DOT[bs]||'dot-gray');}if(cl){cl.textContent=BOT_LABEL[bs]||bs||'Disconnected';}
   document.getElementById('sm-status').textContent=BOT_LABEL[bs]||s.status||'\u2014';
   document.getElementById('sm-state').textContent=s.configured?'Configured':'Not Configured';
   document.getElementById('sm-last-check').textContent=fmt(s.lastCheck);
