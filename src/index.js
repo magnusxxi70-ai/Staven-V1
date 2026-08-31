@@ -16,6 +16,17 @@ import {
   cleanupRefresh,
 } from './session.js';
 import { protections, redact } from './security.js';
+import {
+  loadRoles,
+  getRoles,
+  getUserRole,
+  addUserToStage,
+  removeUserFromStage,
+  stageRoles,
+  commitPendingRoles,
+  discardPendingRoles,
+  getPendingRoles,
+} from './roles.js';
 
 process.on('uncaughtException', e => console.error('[STAVEN BLUE V1]', redact(e?.message || e)));
 process.on('unhandledRejection', e => console.error('[STAVEN BLUE V1]', redact(e?.message || e)));
@@ -211,6 +222,51 @@ app.post('/api/session/refresh', apiAuth, async (_req, res) => {
   }
 });
 
+/* ── Roles / Admin Management API ────────────────────── */
+
+app.get('/api/roles', apiAuth, (_req, res) => {
+  res.json(getRoles());
+});
+
+app.get('/api/roles/staged', apiAuth, (_req, res) => {
+  res.json({ staged: getPendingRoles() });
+});
+
+app.get('/api/roles/limits', apiAuth, (_req, res) => {
+  res.json({ owner: 1, superAdmin: 15, admin: 20 });
+});
+
+app.post('/api/roles/add', apiAuth, (req, res) => {
+  const { userId, role } = req.body || {};
+  if (!userId || !role) return res.status(400).json({ ok: false, error: 'userId and role are required' });
+  const result = addUserToStage(userId, role);
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.post('/api/roles/remove', apiAuth, (req, res) => {
+  const { userId } = req.body || {};
+  if (!userId) return res.status(400).json({ ok: false, error: 'userId is required' });
+  const result = removeUserFromStage(userId);
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.post('/api/roles/save', apiAuth, async (_req, res) => {
+  try {
+    const result = await commitPendingRoles();
+    if (!result.ok) return res.status(400).json(result);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Failed to save roles' });
+  }
+});
+
+app.post('/api/roles/discard', apiAuth, (_req, res) => {
+  discardPendingRoles();
+  res.json({ ok: true });
+});
+
 /* ── Dashboard (protected by cookie) ────────────────────── */
 app.get('/', requireAuth, (_req, res) => {
   const protectionText = JSON.stringify(protections.map(x => '\u2713 ' + x).join('\n'));
@@ -263,6 +319,11 @@ pre{white-space:pre-wrap;line-height:1.65}
 <div class="top"><div><h1>STAVEN BLUE V1</h1><div class="muted">Control Center</div></div>
 <div class="top-right"><button class="btn-secondary" onclick="location.href='/logout'">Logout</button><button onclick="refresh()">Refresh</button></div>
 </div>
+
+<nav style="display:flex;gap:0;margin-bottom:24px;background:#131720;border-radius:14px;border:1px solid #252b38;overflow:hidden;width:fit-content">
+<a href="/" style="padding:10px 24px;text-decoration:none;color:#eef1f6;font-weight:700;font-size:14px;background:#4f7cff">Main</a>
+<a href="/settings" style="padding:10px 24px;text-decoration:none;color:#929caf;font-weight:600;font-size:14px;transition:background .2s" onmouseover="this.style.background='#1a1f2e'" onmouseout="this.style.background='transparent'">Settings</a>
+</nav>
 
 <div class="grid" id="cards">
 <div class="card"><div class="muted">Bot</div><div class="v" id="bot-status">\u2014</div></div>
@@ -477,8 +538,239 @@ setInterval(loadRefreshStats,15000);
 </body></html>`);
 });
 
+/* ── Settings page (protected by cookie) ──────────────── */
+app.get('/settings', requireAuth, (_req, res) => {
+  const authB64 = Buffer.from(config.dashboardUser + ':' + config.dashboardPassword).toString('base64');
+
+  res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STAVEN BLUE V1 — Settings</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#090b10;color:#eef1f6;font-family:Inter,system-ui,-apple-system,sans-serif}
+main{max-width:1100px;margin:auto;padding:28px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:12px}
+h1{margin:0;font-size:34px}
+h2{margin:0 0 16px;font-size:20px;color:#eef1f6}
+.muted{color:#929caf}
+.card{background:#131720;border:1px solid #252b38;border-radius:18px;padding:20px;box-shadow:0 10px 35px #0003}
+button{padding:11px 15px;border:0;border-radius:11px;font-weight:700;cursor:pointer;transition:opacity .2s}
+button:disabled{opacity:.5;cursor:not-allowed}
+.btn-secondary{background:#252b38;color:#eef1f6}.btn-secondary:hover{background:#353d4e}
+.btn-sm{padding:7px 14px;font-size:13px}
+.btn-green{background:#16a34a;color:#fff}.btn-green:hover{background:#15803d}
+.btn-blue{background:#2563eb;color:#fff}.btn-blue:hover{background:#1d4ed8}
+.btn-orange{background:#d97706;color:#fff}.btn-orange:hover{background:#b45309}
+.btn-red{background:#dc2626;color:#fff}.btn-red:hover{background:#b91c1c}
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:11px;font-weight:600;font-size:14px;z-index:9999;display:none;box-shadow:0 4px 15px #0005;max-width:90vw}
+.toast-ok{background:#16a34a;color:#fff}
+.toast-err{background:#dc2626;color:#fff}
+.role-section{margin-bottom:24px}
+.role-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.role-badge{display:inline-block;padding:3px 10px;border-radius:8px;font-size:12px;font-weight:700;margin-right:8px}
+.role-owner{background:#854d0e;color:#fbbf24}
+.role-super{background:#1e3a5f;color:#60a5fa}
+.role-admin{background:#1a3a2a;color:#4ade80}
+.user-row{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#0e1017;border:1px solid #252b38;border-radius:11px;margin-bottom:8px;font-size:14px}
+.user-row .uid{font-family:monospace;color:#eef1f6}
+.user-row .remove-btn{background:#dc2626;color:#fff;border:0;padding:5px 12px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer}
+.user-row .remove-btn:hover{background:#b91c1c}
+.add-form{display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-top:12px}
+.add-form .field{flex:1;min-width:120px}
+.add-form label{display:block;font-size:12px;color:#929caf;margin-bottom:4px}
+.add-form input,.add-form select{width:100%;padding:9px 12px;border:1px solid #252b38;border-radius:9px;background:#0e1017;color:#eef1f6;font-size:13px;outline:none}
+.add-form input:focus,.add-form select:focus{border-color:#4f7cff}
+.count{font-size:13px;color:#929caf;margin-bottom:8px}
+.pending-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#78350f;border:1px solid #92400e;border-radius:11px;margin-top:16px;color:#fbbf24;font-size:13px;font-weight:600}
+.empty{padding:16px;color:#6b7280;font-size:13px;font-style:italic}
+</style>
+</head>
+<body><main>
+<div class="top"><div><h1>STAVEN BLUE V1</h1><div class="muted">Settings</div></div>
+<div class="top-right" style="display:flex;gap:10px;align-items:center"><a href="/" style="text-decoration:none;padding:11px 15px;border-radius:11px;font-weight:700;background:#252b38;color:#eef1f6;display:inline-block">← Main</a><button class="btn-secondary" onclick="location.href='/logout'">Logout</button></div>
+</div>
+
+<nav style="display:flex;gap:0;margin-bottom:24px;background:#131720;border-radius:14px;border:1px solid #252b38;overflow:hidden;width:fit-content">
+<a href="/" style="padding:10px 24px;text-decoration:none;color:#929caf;font-weight:600;font-size:14px;transition:background .2s" onmouseover="this.style.background='#1a1f2e'" onmouseout="this.style.background='transparent'">Main</a>
+<a href="/settings" style="padding:10px 24px;text-decoration:none;color:#eef1f6;font-weight:700;font-size:14px;background:#4f7cff">Settings</a>
+</nav>
+
+<div class="card">
+<h2>Admin Management</h2>
+<div class="muted" style="margin-bottom:16px;font-size:13px">Manage bot command permissions. Changes are staged until you click <b>Save Changes</b>.</div>
+
+<div class="pending-bar" id="pending-bar" style="display:none">
+⚠ <span id="pending-count">0</span> uncommitted change(s) — click Save Changes to apply.
+<button class="btn-sm btn-orange" onclick="discardChanges()" style="margin-left:auto">Discard</button>
+</div>
+
+<!-- OWNER -->
+<div class="role-section">
+<div class="role-header">
+<div><span class="role-badge role-owner">OWNER</span><b>Owner</b></div>
+<div class="count"><span id="owner-count">0</span> / 1</div>
+</div>
+<div id="owner-list"></div>
+<div class="add-form">
+<div class="field"><label>User ID</label><input id="owner-uid" placeholder="e.g. 1000123456789"></div>
+<button class="btn-sm btn-green" onclick="addUser('owner')">Add Owner</button>
+</div>
+</div>
+
+<!-- SUPER ADMINS -->
+<div class="role-section">
+<div class="role-header">
+<div><span class="role-badge role-super">SUPER ADMIN</span><b>Super Admins</b></div>
+<div class="count"><span id="super-count">0</span> / 15</div>
+</div>
+<div id="super-list"></div>
+<div class="add-form">
+<div class="field"><label>User ID</label><input id="super-uid" placeholder="e.g. 1000123456789"></div>
+<button class="btn-sm btn-blue" onclick="addUser('superAdmin')">Add Super Admin</button>
+</div>
+</div>
+
+<!-- ADMINS -->
+<div class="role-section">
+<div class="role-header">
+<div><span class="role-badge role-admin">ADMIN</span><b>Admins</b></div>
+<div class="count"><span id="admin-count">0</span> / 20</div>
+</div>
+<div id="admin-list"></div>
+<div class="add-form">
+<div class="field"><label>User ID</label><input id="admin-uid" placeholder="e.g. 1000123456789"></div>
+<button class="btn-sm btn-orange" onclick="addUser('admin')">Add Admin</button>
+</div>
+</div>
+
+<div style="margin-top:20px;display:flex;gap:10px;flex-wrap:wrap">
+<button id="btn-save" class="btn-green" onclick="saveChanges()">Save Changes</button>
+<button id="btn-discard" class="btn-secondary" onclick="discardChanges()">Discard</button>
+</div>
+<div id="settings-msg" class="muted" style="margin-top:10px"></div>
+</div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var auth='Basic ${authB64}';
+var H={Authorization:auth,'Content-Type':'application/json'};
+var staged={owner:[],superAdmins:[],admins:[]};
+var committed={owner:[],superAdmins:[],admins:[]};
+
+function showToast(m,ok){
+  var t=document.getElementById('toast');
+  t.textContent=m;t.className='toast '+(ok?'toast-ok':'toast-err');t.style.display='block';
+  setTimeout(function(){t.style.display='none'},4000);
+}
+
+function renderUsers(listId,users,role){
+  var el=document.getElementById(listId);
+  if(!users||users.length===0){el.innerHTML='<div class="empty">No users</div>';return}
+  el.innerHTML=users.map(function(uid){
+    return '<div class="user-row"><span class="uid">User ID: '+uid+'</span><button class="remove-btn" onclick="removeUser(\''+uid+'\')">Remove</button></div>';
+  }).join('');
+}
+
+function renderAll(){
+  renderUsers('owner-list',staged.owner,'owner');
+  renderUsers('super-list',staged.superAdmins,'superAdmin');
+  renderUsers('admin-list',staged.admins,'admin');
+  document.getElementById('owner-count').textContent=staged.owner.length;
+  document.getElementById('super-count').textContent=staged.superAdmins.length;
+  document.getElementById('admin-count').textContent=staged.admins.length;
+  // Show pending bar if changes differ from committed
+  var changed=JSON.stringify(staged)!==JSON.stringify(committed);
+  document.getElementById('pending-bar').style.display=changed?'flex':'none';
+  if(changed){
+    var n=0;
+    n+=Math.abs(staged.owner.length-committed.owner.length);
+    n+=Math.abs(staged.superAdmins.length-committed.superAdmins.length);
+    n+=Math.abs(staged.admins.length-committed.admins.length);
+    // Count moves too
+    var allS=[...staged.owner,...staged.superAdmins,...staged.admins];
+    var allC=[...committed.owner,...committed.superAdmins,...committed.admins];
+    allS.forEach(function(id){if(allC.indexOf(id)===-1)n++});
+    document.getElementById('pending-count').textContent=Math.max(n,changed?'1':'0');
+  }
+}
+
+async function loadRoles(){
+  try{
+    var r=await fetch('/api/roles',{headers:H});
+    if(!r.ok)return;
+    committed=await r.json();
+    staged={owner:[...committed.owner],superAdmins:[...committed.superAdmins],admins:[...committed.admins]};
+    renderAll();
+  }catch(e){}
+}
+
+async function addUser(role){
+  var inputMap={owner:'owner-uid',superAdmin:'super-uid',admin:'admin-uid'};
+  var input=document.getElementById(inputMap[role]);
+  var uid=input.value.trim();
+  if(!uid){showToast('Enter a User ID',false);return}
+  var r=await fetch('/api/roles/add',{method:'POST',headers:H,body:JSON.stringify({userId:uid,role:role})});
+  var j=await r.json();
+  if(j.ok&&j.staged){
+    staged=j.staged;
+    input.value='';
+    renderAll();
+    showToast('Added to pending changes',true);
+  }else{
+    showToast(j.error||'Failed',false);
+  }
+}
+
+async function removeUser(uid){
+  var r=await fetch('/api/roles/remove',{method:'POST',headers:H,body:JSON.stringify({userId:uid})});
+  var j=await r.json();
+  if(j.ok&&j.staged){
+    staged=j.staged;
+    renderAll();
+    showToast('Removed from pending changes',true);
+  }else{
+    showToast(j.error||'Failed',false);
+  }
+}
+
+async function saveChanges(){
+  var btn=document.getElementById('btn-save');
+  btn.disabled=true;btn.textContent='Saving...';
+  try{
+    var r=await fetch('/api/roles/save',{method:'POST',headers:H});
+    var j=await r.json();
+    if(j.ok){
+      committed=j.roles;
+      staged={owner:[...committed.owner],superAdmins:[...committed.superAdmins],admins:[...committed.admins]};
+      renderAll();
+      showToast('\u2713 Changes saved successfully',true);
+    }else{
+      showToast('\u2717 '+j.error||'Failed to save',false);
+    }
+  }catch(e){showToast('Network error',false)}
+  finally{btn.disabled=false;btn.textContent='Save Changes'}
+}
+
+async function discardChanges(){
+  await fetch('/api/roles/discard',{method:'POST',headers:H});
+  staged={owner:[...committed.owner],superAdmins:[...committed.superAdmins],admins:[...committed.admins]};
+  renderAll();
+  showToast('Changes discarded',true);
+}
+
+loadRoles();
+</script>
+</body></html>`);
+});
+
 /* ── Start ───────────────────────────────────────────────── */
 
+await loadRoles();
 await loadSessionState();
 
 const port = Number(process.env.PORT || config.port || 3000);

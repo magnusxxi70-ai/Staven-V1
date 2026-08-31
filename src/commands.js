@@ -1,3 +1,5 @@
+import { hasPermission } from './roles.js';
+
 const cooldowns = new Map();
 
 export function handleCommand(message) {
@@ -5,11 +7,18 @@ export function handleCommand(message) {
   if (!body.startsWith('!')) return null;
 
   const [name] = body.slice(1).split(/\s+/);
-  const key = `${message.senderID}:${name.toLowerCase()}`;
+  const senderID = String(message?.senderID || '');
+
+  const key = `${senderID}:${name.toLowerCase()}`;
   const now = Date.now();
 
   if (now - (cooldowns.get(key) || 0) < 1500) return { type: 'cooldown' };
   cooldowns.set(key, now);
+
+  // ── Permission check ──────────────────────────────────
+  if (!hasPermission(senderID, 'admin')) {
+    return { type: 'no_permission' };
+  }
 
   if (name.toLowerCase() === 'ping') {
     return { type: 'reply', text: 'STAVEN BLUE V1 • pong' };

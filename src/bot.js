@@ -40,6 +40,7 @@ export async function startBot(appStateArray) {
         if (result?.type === 'reply' && event?.threadID) {
           bot.api?.sendMessage(result.text, event.threadID);
         }
+        // no_permission: silently ignore — do not reply
       } catch {}
     });
 
