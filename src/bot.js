@@ -3,8 +3,13 @@ const require = createRequire(import.meta.url);
 const fca = require('@dongdev/fca-unofficial');
 const { createMessengerBot } = fca;
 import { handleCommand } from './commands.js';
+import { trackBotMessage } from './unsend.js';
+import { trackMessage, canReply } from './chats.js';
+import { onHumanMessage, isAngelActive } from './angel.js';
 
 let bot = null;
+let botApi = null; // exported API context for commands
+
 let botState = {
   status: 'disconnected', // connecting | connected | disconnected | error
   lastConnected: null,
@@ -13,6 +18,7 @@ let botState = {
 };
 
 export function getBotState() { return { ...botState }; }
+export function getBotApi() { return botApi; }
 
 export async function startBot(appStateArray) {
   // Stop existing bot first
@@ -27,6 +33,8 @@ export async function startBot(appStateArray) {
       { listenEvents: true, stopOnSignals: false }
     );
 
+    botApi = bot.api || bot;
+
     bot.on('error', (err) => {
       console.error('[BOT] Error:', err?.message || err);
       botState.status = 'error';
@@ -35,13 +43,36 @@ export async function startBot(appStateArray) {
     });
 
     bot.on('messageCreate', (event) => {
-      try {
-        const result = handleCommand(event);
-        if (result?.type === 'reply' && event?.threadID) {
-          bot.api?.sendMessage(result.text, event.threadID);
+      // Use async IIFE to safely handle await inside non-async FCA callback
+      (async () => {
+        try {
+          // Track all messages for chat management
+          trackMessage(event);
+
+          // Check if angel should respond to human messages
+          const threadID = String(event?.threadID || '');
+          if (threadID && event?.senderID && botState.status === 'connected') {
+            const senderID = String(event.senderID);
+            const botID = String(event?.botID || '');
+            const isBot = senderID === '0' || senderID === botID;
+            if (!isBot && isAngelActive(threadID)) {
+              onHumanMessage(threadID, botApi);
+            }
+          }
+
+          // Handle commands
+          const result = handleCommand(event, botApi);
+
+          if (result?.type === 'reply' && threadID) {
+            const msgID = await botApi.sendMessage(result.text, threadID);
+            if (msgID) trackBotMessage(threadID, msgID);
+          }
+          // 'action': command handled its own API calls
+          // 'no_permission'/'cooldown': silently ignore
+        } catch (err) {
+          console.error('[BOT] Message handler error:', err?.message || err);
         }
-        // no_permission: silently ignore — do not reply
-      } catch {}
+      })();
     });
 
     botState.status = 'connected';
@@ -49,6 +80,7 @@ export async function startBot(appStateArray) {
     console.log('[BOT] Connected to Facebook Messenger');
   } catch (err) {
     bot = null;
+    botApi = null;
     botState.status = 'error';
     botState.lastError = new Date().toISOString();
     console.error('[BOT] Failed to start:', err?.message || err);
@@ -59,7 +91,6 @@ export async function startBot(appStateArray) {
 export async function stopBot() {
   if (bot) {
     try {
-      // Try various stop methods the FCA bot may expose
       if (typeof bot.stop === 'function') bot.stop();
       else if (typeof bot.stopListening === 'function') bot.stopListening();
       else if (typeof bot.disconnect === 'function') bot.disconnect();
@@ -67,6 +98,7 @@ export async function stopBot() {
       else if (bot.api && typeof bot.api.logout === 'function') bot.api.logout();
     } catch {}
     bot = null;
+    botApi = null;
   }
   botState.status = 'disconnected';
   botState.lastDisconnected = new Date().toISOString();
