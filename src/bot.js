@@ -4,9 +4,14 @@ import path from 'node:path';
 const require = createRequire(import.meta.url);
 const fca = require('@dongdev/fca-unofficial');
 const { createMessengerBot } = fca;
-import { hasPermission } from './roles.js';
-import { addUserToStage, commitPendingRoles } from './roles.js';
-import { handleStavenCommand, initStavenPrivate, cleanupStavenPrivate } from './stavenPrivateAutoReply.js';
+import { hasPermission, getUserRole } from './roles.js';
+import {
+  handleStavenCommand,
+  initStavenPrivate,
+  cleanupStavenPrivate,
+  isMessageProcessed,
+  markMessageProcessed,
+} from './stavenPrivateAutoReply.js';
 import { handleSuperAdminCommand, loadSuperAdmins } from './stavenSuperAdminManager.js';
 import { handleStavenChat, handleChatReply, loadChatState } from './stavenChat.js';
 
@@ -60,9 +65,19 @@ export async function startBot(appStateArray) {
 
     botApi = bot.api || bot;
 
-    // Initialize STAVEN PRIVATE AUTO REPLY (DM system) and restore active schedulers
+    // Cache the bot's own ID for self-message detection
+    let cachedBotID = '';
+    try {
+      if (typeof botApi.getCurrentUserID === 'function') {
+        cachedBotID = String(await botApi.getCurrentUserID());
+      }
+    } catch {}
+    const botID = cachedBotID;
+
+    // Initialize STAVEN PRIVATE AUTO REPLY (DM system)
+    // Pass getUserRole from roles.js so STAVEN can check permissions
     const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
-    await initStavenPrivate(sendFn);
+    await initStavenPrivate(sendFn, getUserRole);
 
     // Initialize STAVEN SUPER ADMIN MANAGER
     await loadSuperAdmins();
@@ -84,25 +99,39 @@ export async function startBot(appStateArray) {
       const messageID = String(event?.messageID || '');
       if (!threadID) return;
 
-      // ── Identify bot messages ─────────────────────────
-      const botID = String(event?.botID || '');
+      // ════════════════════════════════════════════════════════
+      // DEDUPLICATION — prevent processing same message twice
+      // ════════════════════════════════════════════════════════
+      if (messageID && isMessageProcessed(messageID)) return;
+      if (messageID) markMessageProcessed(messageID);
+
+      // ════════════════════════════════════════════════════════
+      // BOT MESSAGE HANDLING (selfListen: true)
+      // ════════════════════════════════════════════════════════
       const isBotMsg = senderID === '0' || senderID === botID;
 
-      // ── Self-message handling (when selfListen is enabled) ───
       if (isBotMsg) {
+        // For self-messages, check STAVEN commands only
         if (body.startsWith('!ستافين')) {
           const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
-          const checkPerm = async (uid, level) => hasPermission(uid, level);
-          if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
-          if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
-          if (handleStavenCommand(event, sendFn)) return;
+          if (await handleStavenCommand(event, sendFn, { isBotMsg: true, botID })) return;
+          if (await handleStavenChat(event, sendFn, botApi, async (uid, lvl) => hasPermission(uid, lvl))) return;
+          if (await handleSuperAdminCommand(event, sendFn, async (uid, lvl) => hasPermission(uid, lvl))) return;
         }
-        // All other bot messages: ignore completely
+        // All other bot messages: ignore completely (prevent loops)
         return;
       }
 
+      // ════════════════════════════════════════════════════════
+      // HUMAN MESSAGE HANDLING
+      // ════════════════════════════════════════════════════════
       const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
-      const checkPerm = async (uid, level) => hasPermission(uid, level);
+
+      // Permission check: bot owner always passes, others go through roles.js
+      const checkPerm = async (uid, level) => {
+        if (botID && uid === botID) return true; // Bot owner bypass
+        return hasPermission(uid, level);
+      };
 
       // ── STAVEN CHAT MANAGER — must be before other ستافين handlers ─
       if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
@@ -111,7 +140,8 @@ export async function startBot(appStateArray) {
       if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
 
       // ── STAVEN PRIVATE AUTO REPLY — DM commands ───────
-      if (handleStavenCommand(event, sendFn)) return;
+      // Only allow Owner/Admins to use STAVEN commands
+      if (await handleStavenCommand(event, sendFn, { isBotMsg: false, botID, checkPerm })) return;
 
       // ── STAVEN CHAT — reply-based menu navigation ────
       if (await handleChatReply(event, sendFn, botApi, checkPerm)) return;
@@ -119,39 +149,12 @@ export async function startBot(appStateArray) {
       // ── Command handling ──────────────────────────────
       if (!body.startsWith('!')) return;
 
-      // ── !ستافين تشغيل (Group — old auto-messaging) ────
-      // This handles the group-based stop/resume auto-messaging system
-      if (body === '!ستافين تشغيل' || body === '!ستافين تشغيل ') {
-        if (!hasPermission(senderID, 'superAdmin')) {
-          try { botApi.sendMessage('❌ هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
-          return;
-        }
-
-        // Group auto-messaging: sends "ككك" with smart stop/resume
-        log(`Group auto-messaging requested in ${threadID} by ${senderID}`);
-        // NOTE: The old group auto-messaging system has been removed.
-        // Use !ستافين تشغيل in DM for the private auto-reply system.
-        // For groups, this command is a no-op now.
-        try { botApi.sendMessage('⚠️ نظام الرسائل التلقائية للغروبات تم إيقافه.\nاستخدم !ستافين تشغيل في المحادثة الخاصة (DM).', threadID); } catch {}
-        tryUnsend(messageID);
-        return;
-      }
-
-      // ── !ستافين ايقاف (Group) ─────────────────────────
-      if (body === '!ستافين ايقاف' || body === '!ستافين ايقاف ') {
-        if (!hasPermission(senderID, 'superAdmin')) {
-          try { botApi.sendMessage('❌ هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
-          return;
-        }
-
-        try { botApi.sendMessage('⚠️ نظام الرسائل التلقائية للغروبات غير نشط حالياً.', threadID); } catch {}
-        tryUnsend(messageID);
-        return;
-      }
-
       // ── !uptime ──────────────────────────────────────
       const cmd = body.split(/\s+/)[0].toLowerCase();
       if (cmd === '!uptime') {
+        // Permission check for uptime
+        if (!await checkPerm(senderID, 'admin')) return;
+
         const totalSec = Math.floor(process.uptime());
         const days = Math.floor(totalSec / 86400);
         const hours = Math.floor((totalSec % 86400) / 3600);
