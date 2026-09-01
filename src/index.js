@@ -19,13 +19,14 @@ import { protections, redact } from './security.js';
 import {
   loadRoles,
   getRoles,
+  getStagedRoles,
   getUserRole,
   addUserToStage,
   removeUserFromStage,
   stageRoles,
+  saveRolesFromData,
   commitPendingRoles,
   discardPendingRoles,
-  getPendingRoles,
 } from './roles.js';
 
 process.on('uncaughtException', e => console.error('[STAVEN BLUE V1]', redact(e?.message || e)));
@@ -229,7 +230,8 @@ app.get('/api/roles', apiAuth, (_req, res) => {
 });
 
 app.get('/api/roles/staged', apiAuth, (_req, res) => {
-  res.json({ staged: getPendingRoles() });
+  const staged = getStagedRoles();
+  res.json({ staged: staged || getRoles() });
 });
 
 app.get('/api/roles/limits', apiAuth, (_req, res) => {
@@ -252,8 +254,16 @@ app.post('/api/roles/remove', apiAuth, (req, res) => {
   res.json(result);
 });
 
-app.post('/api/roles/save', apiAuth, async (_req, res) => {
+app.post('/api/roles/save', apiAuth, async (req, res) => {
   try {
+    // Accept staged data from request body (frontend sends full state)
+    const bodyData = req.body;
+    if (bodyData && bodyData.owner) {
+      const result = await saveRolesFromData(bodyData);
+      if (!result.ok) return res.status(400).json(result);
+      return res.json(result);
+    }
+    // Fallback: commit existing server-side pending state
     const result = await commitPendingRoles();
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
@@ -661,6 +671,7 @@ var auth='Basic ${authB64}';
 var H={Authorization:auth,'Content-Type':'application/json'};
 var staged={owner:[],superAdmins:[],admins:[]};
 var committed={owner:[],superAdmins:[],admins:[]};
+var saving=false;
 
 function showToast(m,ok){
   var t=document.getElementById('toast');
@@ -668,45 +679,45 @@ function showToast(m,ok){
   setTimeout(function(){t.style.display='none'},4000);
 }
 
-function renderUsers(listId,users,role){
+function renderUsers(listId,users){
   var el=document.getElementById(listId);
   if(!users||users.length===0){el.innerHTML='<div class="empty">No users</div>';return}
   el.innerHTML=users.map(function(uid){
-    return '<div class="user-row"><span class="uid">User ID: '+uid+'</span><button class="remove-btn" onclick="removeUser(\''+uid+'\')">Remove</button></div>';
+    return '<div class="user-row"><span class="uid">User ID: '+uid+'</span><button class="remove-btn" onclick="removeUser(&quot;'+uid+'&quot;)">Remove</button></div>';
   }).join('');
 }
 
 function renderAll(){
-  renderUsers('owner-list',staged.owner,'owner');
-  renderUsers('super-list',staged.superAdmins,'superAdmin');
-  renderUsers('admin-list',staged.admins,'admin');
+  renderUsers('owner-list',staged.owner);
+  renderUsers('super-list',staged.superAdmins);
+  renderUsers('admin-list',staged.admins);
   document.getElementById('owner-count').textContent=staged.owner.length;
   document.getElementById('super-count').textContent=staged.superAdmins.length;
   document.getElementById('admin-count').textContent=staged.admins.length;
-  // Show pending bar if changes differ from committed
   var changed=JSON.stringify(staged)!==JSON.stringify(committed);
   document.getElementById('pending-bar').style.display=changed?'flex':'none';
   if(changed){
     var n=0;
-    n+=Math.abs(staged.owner.length-committed.owner.length);
-    n+=Math.abs(staged.superAdmins.length-committed.superAdmins.length);
-    n+=Math.abs(staged.admins.length-committed.admins.length);
-    // Count moves too
-    var allS=[...staged.owner,...staged.superAdmins,...staged.admins];
-    var allC=[...committed.owner,...committed.superAdmins,...committed.admins];
+    var allS=[].concat(staged.owner,staged.superAdmins,staged.admins);
+    var allC=[].concat(committed.owner,committed.superAdmins,committed.admins);
     allS.forEach(function(id){if(allC.indexOf(id)===-1)n++});
-    document.getElementById('pending-count').textContent=Math.max(n,changed?'1':'0');
+    allC.forEach(function(id){if(allS.indexOf(id)===-1)n++});
+    document.getElementById('pending-count').textContent=Math.max(n,1);
   }
 }
 
 async function loadRoles(){
   try{
-    var r=await fetch('/api/roles',{headers:H});
-    if(!r.ok)return;
-    committed=await r.json();
-    staged={owner:[...committed.owner],superAdmins:[...committed.superAdmins],admins:[...committed.admins]};
+    var r1=await fetch('/api/roles',{headers:H});
+    if(!r1.ok){showToast('Failed to load roles',false);return}
+    committed=await r1.json();
+    try{
+      var r2=await fetch('/api/roles/staged',{headers:H});
+      if(r2.ok){var d=await r2.json();if(d.staged)committed=d.staged;}
+    }catch(e){}
+    staged={owner:committed.owner?committed.owner.slice():[],superAdmins:committed.superAdmins?committed.superAdmins.slice():[],admins:committed.admins?committed.admins.slice():[]};
     renderAll();
-  }catch(e){}
+  }catch(e){showToast('Failed to load roles: '+e.message,false)}
 }
 
 async function addUser(role){
@@ -722,43 +733,51 @@ async function addUser(role){
     renderAll();
     showToast('Added to pending changes',true);
   }else{
-    showToast(j.error||'Failed',false);
+    showToast(j.error||'Failed to add',false);
   }
 }
 
 async function removeUser(uid){
-  var r=await fetch('/api/roles/remove',{method:'POST',headers:H,body:JSON.stringify({userId:uid})});
+  var r=await fetch('/api/roles/remove',{method:'POST',headers:H,body:JSON.stringify({userId:String(uid)})});
   var j=await r.json();
   if(j.ok&&j.staged){
     staged=j.staged;
     renderAll();
     showToast('Removed from pending changes',true);
   }else{
-    showToast(j.error||'Failed',false);
+    showToast(j.error||'Failed to remove',false);
   }
 }
 
 async function saveChanges(){
+  if(saving)return;
+  saving=true;
   var btn=document.getElementById('btn-save');
   btn.disabled=true;btn.textContent='Saving...';
+  var msg=document.getElementById('settings-msg');
+  msg.textContent='';
   try{
-    var r=await fetch('/api/roles/save',{method:'POST',headers:H});
+    var body={owner:staged.owner.slice(),superAdmins:staged.superAdmins.slice(),admins:staged.admins.slice()};
+    var r=await fetch('/api/roles/save',{method:'POST',headers:H,body:JSON.stringify(body)});
     var j=await r.json();
-    if(j.ok){
+    if(r.ok&&j.ok){
       committed=j.roles;
-      staged={owner:[...committed.owner],superAdmins:[...committed.superAdmins],admins:[...committed.admins]};
+      staged={owner:committed.owner?committed.owner.slice():[],superAdmins:committed.superAdmins?committed.superAdmins.slice():[],admins:committed.admins?committed.admins.slice():[]};
       renderAll();
-      showToast('\u2713 Changes saved successfully',true);
+      showToast('Changes saved successfully',true);
+      msg.textContent='Saved.';msg.style.color='#22c55e';
     }else{
-      showToast('\u2717 '+j.error||'Failed to save',false);
+      var errMsg=j.error||'Failed to save';
+      showToast(errMsg,false);
+      msg.textContent=errMsg;msg.style.color='#ef4444';
     }
-  }catch(e){showToast('Network error',false)}
-  finally{btn.disabled=false;btn.textContent='Save Changes'}
+  }catch(e){showToast('Network error: '+e.message,false);msg.textContent='Network error';msg.style.color='#ef4444'}
+  finally{saving=false;btn.disabled=false;btn.textContent='Save Changes'}
 }
 
 async function discardChanges(){
   await fetch('/api/roles/discard',{method:'POST',headers:H});
-  staged={owner:[...committed.owner],superAdmins:[...committed.superAdmins],admins:[...committed.admins]};
+  staged={owner:committed.owner?committed.owner.slice():[],superAdmins:committed.superAdmins?committed.superAdmins.slice():[],admins:committed.admins?committed.admins.slice():[]};
   renderAll();
   showToast('Changes discarded',true);
 }

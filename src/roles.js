@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const ROLES_FILE = path.resolve('data/roles.json');
+const STAGED_FILE = path.resolve('data/roles-staged.json');
 
 const LIMITS = {
   owner: 1,
@@ -18,6 +19,8 @@ const roles = {
   admins: [],     // max 20
 };
 
+let pendingRoles = null;
+
 /* ── Persistence ───────────────────────────────────────── */
 
 export async function loadRoles() {
@@ -27,12 +30,26 @@ export async function loadRoles() {
     if (saved.superAdmins) roles.superAdmins = saved.superAdmins;
     if (saved.admins) roles.admins = saved.admins;
   } catch { /* no saved state yet */ }
+  // Also load any staged pending changes
+  try {
+    const staged = JSON.parse(await fs.readFile(STAGED_FILE, 'utf8'));
+    pendingRoles = staged;
+  } catch { /* no staged state */ }
   return getRoles();
 }
 
 async function saveRoles() {
   await fs.mkdir(path.dirname(ROLES_FILE), { recursive: true });
   await fs.writeFile(ROLES_FILE, JSON.stringify(roles, null, 2));
+}
+
+async function saveStaged() {
+  await fs.mkdir(path.dirname(STAGED_FILE), { recursive: true });
+  if (pendingRoles) {
+    await fs.writeFile(STAGED_FILE, JSON.stringify(pendingRoles, null, 2));
+  } else {
+    try { await fs.unlink(STAGED_FILE); } catch { /* ok */ }
+  }
 }
 
 /* ── Read-only accessors ───────────────────────────────── */
@@ -43,6 +60,11 @@ export function getRoles() {
     superAdmins: [...roles.superAdmins],
     admins: [...roles.admins],
   };
+}
+
+export function getStagedRoles() {
+  if (pendingRoles) return { ...pendingRoles, owner: [...pendingRoles.owner], superAdmins: [...pendingRoles.superAdmins], admins: [...pendingRoles.admins] };
+  return null;
 }
 
 /**
@@ -67,21 +89,10 @@ export function hasPermission(userId, minLevel = 'admin') {
   return (ROLE_LEVEL[role] || 0) >= (ROLE_LEVEL[minLevel] || 0);
 }
 
-/* ── Mutation operations (apply/pending) ───────────────── */
+/* ── Validation helper ─────────────────────────────────── */
 
-/**
- * Stage changes. Returns a snapshot of what would change.
- * caller must call commitPendingRoles to actually save.
- */
-let pendingRoles = null;
-
-export function getPendingRoles() {
-  return pendingRoles ? { ...pendingRoles } : null;
-}
-
-export function stageRoles(newRoles) {
-  // Validate structure
-  if (!newRoles || typeof newRoles !== 'object') return { ok: false, error: 'Invalid roles data' };
+function validateRoles(data) {
+  if (!data || typeof data !== 'object') return { ok: false, error: 'Invalid roles data' };
 
   const staged = {
     owner: [],
@@ -90,27 +101,27 @@ export function stageRoles(newRoles) {
   };
 
   // Process owner (max 1)
-  if (newRoles.owner && Array.isArray(newRoles.owner)) {
-    if (newRoles.owner.length > LIMITS.owner) {
+  if (data.owner && Array.isArray(data.owner)) {
+    if (data.owner.length > LIMITS.owner) {
       return { ok: false, error: `Owner limit exceeded. Maximum: ${LIMITS.owner}` };
     }
-    staged.owner = newRoles.owner.map(String).filter(Boolean);
+    staged.owner = data.owner.map(String).filter(Boolean);
   }
 
   // Process superAdmins (max 15)
-  if (newRoles.superAdmins && Array.isArray(newRoles.superAdmins)) {
-    if (newRoles.superAdmins.length > LIMITS.superAdmin) {
+  if (data.superAdmins && Array.isArray(data.superAdmins)) {
+    if (data.superAdmins.length > LIMITS.superAdmin) {
       return { ok: false, error: `Super Admin limit exceeded. Maximum: ${LIMITS.superAdmin}` };
     }
-    staged.superAdmins = newRoles.superAdmins.map(String).filter(Boolean);
+    staged.superAdmins = data.superAdmins.map(String).filter(Boolean);
   }
 
   // Process admins (max 20)
-  if (newRoles.admins && Array.isArray(newRoles.admins)) {
-    if (newRoles.admins.length > LIMITS.admins) {
-      return { ok: false, error: `Admin limit exceeded. Maximum: ${LIMITS.admins}` };
+  if (data.admins && Array.isArray(data.admins)) {
+    if (data.admins.length > LIMITS.admin) {
+      return { ok: false, error: `Admin limit exceeded. Maximum: ${LIMITS.admin}` };
     }
-    staged.admins = newRoles.admins.map(String).filter(Boolean);
+    staged.admins = data.admins.map(String).filter(Boolean);
   }
 
   // Check for duplicates across all roles
@@ -123,26 +134,48 @@ export function stageRoles(newRoles) {
     seen.add(id);
   }
 
-  pendingRoles = staged;
   return { ok: true, staged };
+}
+
+/* ── Mutation operations ───────────────────────────────── */
+
+/**
+ * Save roles from client-sent staged data (the main save flow).
+ */
+export async function saveRolesFromData(data) {
+  const result = validateRoles(data);
+  if (!result.ok) return result;
+
+  roles.owner = [...result.staged.owner];
+  roles.superAdmins = [...result.staged.superAdmins];
+  roles.admins = [...result.staged.admins];
+
+  pendingRoles = null;
+  await saveRoles();
+  await saveStaged();
+
+  return { ok: true, roles: getRoles() };
+}
+
+/**
+ * Stage changes. Returns a snapshot of what would change.
+ */
+export function stageRoles(newRoles) {
+  const result = validateRoles(newRoles);
+  if (!result.ok) return result;
+  pendingRoles = result.staged;
+  saveStaged().catch(() => {}); // persist in background
+  return { ok: true, staged: result.staged };
 }
 
 export async function commitPendingRoles() {
   if (!pendingRoles) return { ok: false, error: 'No pending changes to save' };
-
-  roles.owner = [...pendingRoles.owner];
-  roles.superAdmins = [...pendingRoles.superAdmins];
-  roles.admins = [...pendingRoles.admins];
-
-  await saveRoles();
-
-  const result = { ...roles };
-  pendingRoles = null;
-  return { ok: true, roles: result };
+  return saveRolesFromData(pendingRoles);
 }
 
-export function discardPendingRoles() {
+export async function discardPendingRoles() {
   pendingRoles = null;
+  await saveStaged();
   return { ok: true };
 }
 
@@ -170,10 +203,10 @@ export function addUserToStage(userId, role) {
   if (role === 'owner') {
     if (snapshot.owner.length >= LIMITS.owner) return { ok: false, error: `Owner limit reached (${snapshot.owner.length}/${LIMITS.owner})` };
     if (!snapshot.owner.includes(id)) snapshot.owner.push(id);
-  } else  if (role === 'superAdmin') {
+  } else if (role === 'superAdmin') {
     if (snapshot.superAdmins.length >= LIMITS.superAdmin) return { ok: false, error: `Super Admin limit reached (${snapshot.superAdmins.length}/${LIMITS.superAdmin})` };
     if (!snapshot.superAdmins.includes(id)) snapshot.superAdmins.push(id);
-  } else  if (role === 'admin') {
+  } else if (role === 'admin') {
     if (snapshot.admins.length >= LIMITS.admin) return { ok: false, error: `Admin limit reached (${snapshot.admins.length}/${LIMITS.admin})` };
     if (!snapshot.admins.includes(id)) snapshot.admins.push(id);
   } else {
@@ -181,6 +214,7 @@ export function addUserToStage(userId, role) {
   }
 
   pendingRoles = snapshot;
+  saveStaged().catch(() => {}); // persist in background
   return { ok: true, staged: snapshot };
 }
 
@@ -197,6 +231,7 @@ export function removeUserFromStage(userId) {
   };
 
   pendingRoles = snapshot;
+  saveStaged().catch(() => {}); // persist in background
   return { ok: true, staged: snapshot };
 }
 
