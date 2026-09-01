@@ -22,177 +22,160 @@ let botState = {
 export function getBotState() { return { ...botState }; }
 export function getBotApi() { return botApi; }
 
-/* ── Auto-Messaging State ─────────────────────────────── */
+/* ══════════════════════════════════════════════════════════
+   STAVEN AUTO-MESSAGING SYSTEM
+   ══════════════════════════════════════════════════════════ */
 
 const AUTO_MSG_FILE = path.resolve('data/auto-messaging.json');
+const AUTO_MSG = 'ككك';
+const AUTO_INTERVAL = 1; // 1 second
+const MAX_CONSECUTIVE = 2; // send 2 messages then pause
 
-// Per-thread state: { threadID: { message, interval, sentCount, active, paused, timer } }
-const autoStates = {};
+// Per-thread state: { enabled, consecutive, paused, timer, lastSentAt }
+const stavenState = {};
 
-/**
- * Parse duration string to seconds.
- * Supports: 1ث, 2ث, 5ث, 10ث, 30ث, 60ث, 1s, 2s, 5s, 10s, 30s, 60s, or plain numbers.
- */
-function parseDuration(raw) {
-  if (!raw) return null;
-  const cleaned = raw.trim();
-  // Match: digits + ث (Arabic tha)
-  const mArabic = cleaned.match(/^(\d+)[\u0629\u062B]?$/);
-  if (mArabic) return parseInt(mArabic[1], 10);
-  // Match: digits + s (English)
-  const mEnglish = cleaned.match(/^(\d+)s$/i);
-  if (mEnglish) return parseInt(mEnglish[1], 10);
-  // Match: digits only
-  if (/^\d+$/.test(cleaned)) return parseInt(cleaned, 10);
-  return null;
-}
-
-/**
- * Unsend a message if possible.
- */
-async function tryUnsend(messageID) {
-  if (!messageID || !botApi) return;
-  try {
-    if (typeof botApi.unsendMessage === 'function') {
-      await botApi.unsendMessage(messageID);
-    } else if (typeof botApi.unsend === 'function') {
-      await botApi.unsend(messageID);
-    }
-  } catch {}
-}
-
-/**
- * Schedule next auto-send for a thread.
- */
-function scheduleNext(threadID) {
-  const state = autoStates[threadID];
-  if (!state || !state.active) return;
-
-  state.timer = setTimeout(async () => {
-    if (!state.active || !botApi) return;
-
-    try {
-      await botApi.sendMessage(state.message, threadID);
-      state.sentCount++;
-    } catch (err) {
-      console.error(`[AUTO-MSG] Send failed in ${threadID}:`, err?.message);
-    }
-
-    // Smart stop: after 2 messages, pause
-    if (state.sentCount >= 2) {
-      state.active = false;
-      state.paused = true;
-      console.log(`[AUTO-MSG] Paused in ${threadID} after 2 messages`);
-      await saveAutoState();
-      return;
-    }
-
-    // Continue sending
-    scheduleNext(threadID);
-  }, state.interval * 1000);
-
-  if (state.timer?.unref) state.timer.unref();
-}
-
-/**
- * Resume auto-messaging for a thread (called on human message).
- */
-function resumeAuto(threadID) {
-  const state = autoStates[threadID];
-  if (!state || !state.active || !state.paused) return;
-
-  state.active = true;
-  state.paused = false;
-  state.sentCount = 0;
-  console.log(`[AUTO-MSG] Resumed in ${threadID}`);
-  scheduleNext(threadID);
-  saveAutoState().catch(() => {});
-}
-
-/**
- * Stop auto-messaging for a thread.
- */
-function stopAuto(threadID) {
-  const state = autoStates[threadID];
-  if (!state) return false;
-
-  if (state.timer) clearTimeout(state.timer);
-  delete autoStates[threadID];
-  console.log(`[AUTO-MSG] Stopped in ${threadID}`);
-  saveAutoState().catch(() => {});
-  return true;
-}
-
-/**
- * Start auto-messaging for a thread.
- */
-async function startAuto(threadID, message, interval) {
-  // Stop existing timer if any
-  if (autoStates[threadID]?.timer) clearTimeout(autoStates[threadID].timer);
-
-  autoStates[threadID] = {
-    message,
-    interval,
-    sentCount: 0,
-    active: true,
-    paused: false,
-    startedAt: Date.now(),
-  };
-
-  console.log(`[AUTO-MSG] Started in ${threadID}: "${message}" every ${interval}s`);
-  scheduleNext(threadID);
-  await saveAutoState();
-}
-
-/* ── Persistence ──────────────────────────────────────── */
-
-async function saveAutoState() {
-  try {
-    await fs.mkdir(path.dirname(AUTO_MSG_FILE), { recursive: true });
-    const saveData = {};
-    for (const [tid, s] of Object.entries(autoStates)) {
-      saveData[tid] = {
-        message: s.message,
-        interval: s.interval,
-        sentCount: s.sentCount,
-        active: s.active,
-        paused: s.paused,
-        startedAt: s.startedAt,
-      };
-    }
-    await fs.writeFile(AUTO_MSG_FILE, JSON.stringify(saveData, null, 2));
-  } catch {}
-}
-
-async function loadAutoState() {
-  try {
-    const saved = JSON.parse(await fs.readFile(AUTO_MSG_FILE, 'utf8'));
-    for (const [tid, data] of Object.entries(saved)) {
-      if (data.active || data.paused) {
-        autoStates[tid] = { ...data, timer: null };
-        if (data.active && !data.paused) {
-          scheduleNext(tid);
-          console.log(`[AUTO-MSG] Restored active auto-msg in ${tid}`);
-        }
-      }
-    }
-  } catch {}
-}
-
-function cleanupAutoTimers() {
-  for (const s of Object.values(autoStates)) {
-    if (s.timer) clearTimeout(s.timer);
-  }
-}
-
-/* ── Command Helpers ──────────────────────────────────── */
+/* ── Helpers ──────────────────────────────────────────── */
 
 function box(title, lines) {
   const bar = '─'.repeat(32);
   return [`╭${bar}╮`, `│ ${title}`, '│', ...lines, `╰${bar}╯`].join('\n');
 }
 
-/* ── Start Bot ────────────────────────────────────────── */
+async function tryUnsend(messageID) {
+  if (!messageID || !botApi) return;
+  try {
+    if (typeof botApi.unsendMessage === 'function') await botApi.unsendMessage(messageID);
+    else if (typeof botApi.unsend === 'function') await botApi.unsend(messageID);
+  } catch {}
+}
+
+function log(msg) { console.log(`[STAVEN] ${msg}`); }
+
+/* ── Core Send Loop ───────────────────────────────────── */
+
+function sendLoop(threadID) {
+  const state = stavenState[threadID];
+  if (!state || !state.enabled) return;
+
+  // Clear any existing timer first (prevent duplicates)
+  if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+
+  state.timer = setTimeout(async () => {
+    // Re-check state inside callback (may have been stopped)
+    const s = stavenState[threadID];
+    if (!s || !s.enabled) return;
+
+    try {
+      await botApi.sendMessage(AUTO_MSG, threadID);
+      s.consecutive++;
+      s.lastSentAt = Date.now();
+    } catch (err) {
+      log(`Send failed in ${threadID}: ${err?.message}`);
+    }
+
+    // Smart stop: after MAX_CONSECUTIVE messages, pause
+    if (s.consecutive >= MAX_CONSECUTIVE) {
+      s.paused = true;
+      s.enabled = false; // disable the loop, keep state for resume
+      log(`Paused in ${threadID} after ${s.consecutive} messages`);
+      saveState().catch(() => {});
+      return;
+    }
+
+    // Continue loop
+    sendLoop(threadID);
+  }, AUTO_INTERVAL * 1000);
+
+  if (state.timer?.unref) state.timer?.unref();
+}
+
+/* ── Start ────────────────────────────────────────────── */
+
+function startStaven(threadID) {
+  // Clean up any existing state for this thread
+  clearThread(threadID);
+
+  stavenState[threadID] = {
+    enabled: true,
+    consecutive: 0,
+    paused: false,
+    timer: null,
+    lastSentAt: null,
+    startedAt: Date.now(),
+  };
+
+  log(`Started in ${threadID}`);
+  sendLoop(threadID);
+  saveState().catch(() => {});
+}
+
+/* ── Resume (on human message) ────────────────────────── */
+
+function resumeStaven(threadID) {
+  const s = stavenState[threadID];
+  if (!s) return;
+  // Must be paused (was running but stopped after 2 messages)
+  if (!s.paused) return;
+
+  s.paused = false;
+  s.enabled = true;
+  s.consecutive = 0;
+  log(`Resumed in ${threadID}`);
+  sendLoop(threadID);
+  saveState().catch(() => {});
+}
+
+/* ── Stop ─────────────────────────────────────────────── */
+
+function stopStaven(threadID) {
+  const s = stavenState[threadID];
+  if (!s) return false;
+
+  clearThread(threadID);
+  delete stavenState[threadID];
+  log(`Stopped in ${threadID}`);
+  saveState().catch(() => {});
+  return true;
+}
+
+/* ── Cleanup ──────────────────────────────────────────── */
+
+function clearThread(threadID) {
+  const s = stavenState[threadID];
+  if (s?.timer) { clearTimeout(s.timer); s.timer = null; }
+}
+
+function cleanupAll() {
+  for (const tid of Object.keys(stavenState)) clearThread(tid);
+}
+
+/* ── Persistence ──────────────────────────────────────── */
+
+async function saveState() {
+  try {
+    await fs.mkdir(path.dirname(AUTO_MSG_FILE), { recursive: true });
+    const out = {};
+    for (const [tid, s] of Object.entries(stavenState)) {
+      out[tid] = { enabled: s.enabled, consecutive: s.consecutive, paused: s.paused };
+    }
+    await fs.writeFile(AUTO_MSG_FILE, JSON.stringify(out, null, 2));
+  } catch {}
+}
+
+async function loadState() {
+  try {
+    const saved = JSON.parse(await fs.readFile(AUTO_MSG_FILE, 'utf8'));
+    for (const [tid, data] of Object.entries(saved)) {
+      // On restart, don't auto-resume — just note it was active
+      // User must re-trigger with !ستافين تشغيل
+      log(`Found saved state for ${tid} (not auto-resuming)`);
+    }
+  } catch {}
+}
+
+/* ══════════════════════════════════════════════════════════
+   BOT STARTUP
+   ══════════════════════════════════════════════════════════ */
 
 export async function startBot(appStateArray) {
   if (bot) { try { await stopBot(); } catch {} }
@@ -208,8 +191,8 @@ export async function startBot(appStateArray) {
 
     botApi = bot.api || bot;
 
-    // Load saved auto-messaging states
-    await loadAutoState();
+    // Load saved state (informational only, no auto-resume)
+    await loadState();
 
     bot.on('error', (err) => {
       console.error('[BOT] Error:', err?.message || err);
@@ -225,36 +208,31 @@ export async function startBot(appStateArray) {
       const messageID = String(event?.messageID || '');
       if (!threadID) return;
 
-      // ── Monitor human messages to resume auto-messaging ──
-      if (body && senderID) {
-        const botID = String(event?.botID || '');
-        const isBot = senderID === '0' || senderID === botID;
-        // Only non-bot, non-command messages count as human interaction
-        if (!isBot && !body.startsWith('!') && autoStates[threadID]?.paused) {
-          resumeAuto(threadID);
-        }
+      // ── Identify bot messages ─────────────────────────
+      const botID = String(event?.botID || '');
+      const isBotMsg = senderID === '0' || senderID === botID;
+
+      // ── Human message detection for Staven resume ─────
+      // Any non-bot, non-command message resumes the paused system
+      if (!isBotMsg && body && !body.startsWith('!')) {
+        resumeStaven(threadID);
       }
 
+      // ── Command handling ──────────────────────────────
       if (!body.startsWith('!')) return;
 
       // ── !ستافين (help) ─────────────────────────────────
       if (body === '!ستافين' || body === '!ستافين ') {
-        const msg = box('STAVEN BLUE V1', [
+        const msg = box('⚡ Staven Blue V1', [
           '⚙️ نظام الرسائل التلقائية',
           '',
-          '!ستافين تشغيل [الرسالة] [المدة]',
+          '!ستافين تشغيل — تشغيل النظام',
+          '!ستافين ايقاف — إيقاف النظام',
           '',
-          'مثال:',
-          '!ستافين تشغيل ككك 1ث',
-          '!ستافين تشغيل هلا 5s',
-          '',
-          '🛑 للإيقاف:',
-          '!ستافين ايقاف',
-          '',
-          '📌 النظام:',
-          'يرسل رسالتين تلقائيتين، ثم يتوقف',
-          'حتىتحدث أحد أعضاء الغروب،',
-          'وبعدها يستأنف ويرسل رسالتين من جديد.',
+          '📌 كيف يعمل:',
+          'يرسل "ككك" كل ثانية.',
+          'بعد رسالتين يتوقف مؤقتاً.',
+          'عند تحدث عضو يستأنف تلقائياً.',
           '',
           '👑 المطور: Magnus',
         ]);
@@ -269,62 +247,41 @@ export async function startBot(appStateArray) {
           return;
         }
 
-        const stopped = stopAuto(threadID);
-        const msg = box('STAVEN BLUE V1', [
-          stopped ? '🛑 تم إيقاف النظام التلقائي.' : '⚠️ لا يوجد نظام تلقائي نشط.',
+        const stopped = stopStaven(threadID);
+        const msg = box('⚡ Staven Blue V1', [
+          stopped ? '🛑 تم إيقاف الإرسال التلقائي.' : '⚠️ لا يوجد نظام تلقائي نشط.',
           '',
-          '⚙️ الحالة: متوقف',
+          '🤖 البوت: Staven Blue V1',
           '👑 المطور: Magnus',
+          '⚙️ الحالة: متوقف',
         ]);
         try { botApi.sendMessage(msg, threadID); } catch {}
-        // Delete the command message
         tryUnsend(messageID);
         return;
       }
 
-      // ── !ستافين تشغيل [message] [duration] ─────────────
-      if (body.startsWith('!ستافين تشغيل')) {
+      // ── !ستافين تشغيل ──────────────────────────────────
+      if (body === '!ستافين تشغيل' || body === '!ستافين تشغيل ') {
         if (!hasPermission(senderID, 'superAdmin')) {
           try { botApi.sendMessage('❌ هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
           return;
         }
 
-        const args = body.slice('!ستافين تشغيل'.length).trim();
-        if (!args) {
-          try { botApi.sendMessage('❌ يرجى كتابة الرسالة والمدة.\nمثال: !ستافين تشغيل ككك 1ث', threadID); } catch {}
-          return;
-        }
+        startStaven(threadID);
 
-        // Extract duration (last token)
-        const parts = args.split(/\s+/);
-        const durationRaw = parts[parts.length - 1];
-        const interval = parseDuration(durationRaw);
-
-        if (!interval || interval < 1) {
-          try { botApi.sendMessage('❌ المدة غير صحيحة. استخدم: 1ث, 2s, 5ث, 10s, إلخ.', threadID); } catch {}
-          return;
-        }
-
-        // Message is everything except the last token
-        const message = parts.slice(0, -1).join(' ').trim();
-        if (!message) {
-          try { botApi.sendMessage('❌ يرجى كتابة الرسالة.\nمثال: !ستافين تشغيل ككك 1ث', threadID); } catch {}
-          return;
-        }
-
-        await startAuto(threadID, message, interval);
-
-        const msg = box('STAVEN BLUE V1', [
+        const msg = box('⚡ Staven Blue V1', [
           '✅ تم تشغيل النظام بنجاح',
           '',
-          `📝 الرسالة: ${message}`,
-          `⏱️ الفاصل: ${interval} ثانية`,
-          '⚙️ طبيعة الأمر: إرسال تلقائي متكرر',
+          '📝 الرسالة: ككك',
+          '⏱️ الفاصل: كل ثانية',
+          '⚙️ طبيعة النظام: إرسال تلقائي متكرر',
+          '',
+          '📌 يرسل رسالتين ثم يتوقف.',
+          'عند تحدث عضو يستأنف تلقائياً.',
           '',
           '👑 المطور: Magnus',
         ]);
         try { botApi.sendMessage(msg, threadID); } catch {}
-        // Delete the command message
         tryUnsend(messageID);
         return;
       }
@@ -373,7 +330,7 @@ export async function startBot(appStateArray) {
 }
 
 export async function stopBot() {
-  cleanupAutoTimers();
+  cleanupAll();
   if (bot) {
     try {
       if (typeof bot.stop === 'function') bot.stop();
