@@ -2,111 +2,112 @@
  * !unsend — Delete bot messages
  *
  * Usage:
- *   !unsend          — If reply: delete the replied-to message (must be bot's).
- *                      If no reply: delete last bot message in the thread.
- *   !unsend help     — Show usage info
+ *   !unsend          — Delete replied-to message or last bot message
+ *   !unsend help     — Show usage
  *
  * Only deletes bot messages. Never deletes user messages.
  */
 
-// Track last bot message ID per thread: { threadId: messageId }
 const lastBotMessages = new Map();
 
-/**
- * Register a bot-sent message for later unsend.
- * Called after the bot sends any message.
- */
-export function trackBotMessage(threadID, messageID) {
-  if (threadID && messageID) {
-    lastBotMessages.set(String(threadID), String(messageID));
-  }
+/* ── Box helper ───────────────────────────────────────── */
+
+function box(title, lines) {
+  const w = 36;
+  const border = '─'.repeat(w);
+  return [
+    `╭${border}╮`,
+    `│ ${title}`,
+    `╰${border}╯`,
+    ...lines,
+    '─'.repeat(w + 2),
+  ].join('\n');
 }
 
-/**
- * Get the last bot message ID for a thread.
- */
+/* ── Public API ───────────────────────────────────────── */
+
+export function trackBotMessage(threadID, messageID) {
+  if (threadID && messageID) lastBotMessages.set(String(threadID), String(messageID));
+}
+
 export function getLastBotMessageID(threadID) {
   return lastBotMessages.get(String(threadID)) || null;
 }
 
-/**
- * Handle the !unsend command.
- * @param {object} message - FCA messageCreate event
- * @param {object} api - FCA bot API
- * @returns {object} reply object
- */
+/* ── Command Handler ──────────────────────────────────── */
+
 export async function handleUnsend(message, api) {
   const body = String(message?.body || '').trim();
-  const parts = body.split(/\s+/).slice(1); // remove "!unsend"
+  const parts = body.split(/\s+/).slice(1);
   const threadID = String(message?.threadID || '');
 
-  // !unsend help
   if (parts[0]?.toLowerCase() === 'help') {
     return {
       type: 'reply',
-      text: [
-        '🗑️ Usage:',
-        '!unsend — Delete the bot message (reply or last sent)',
+      text: box('🗑️ !unsend — Guide', [
         '',
-        'Reply to a bot message with !unsend to delete it.',
-        'If not replying, deletes the last message the bot sent in this chat.',
-      ].join('\n'),
+        '╭─── الطريقة ────────────────────╮',
+        '│ !unsend                        │',
+        '│   → رد على رسالة البوت          │',
+        '│   → يحذف تلك الرسالة            │',
+        '│                                │',
+        '│ !unsend                        │',
+        '│   → بدون رد                     │',
+        '│   → يحذف آخر رسالة للبوت        │',
+        '╰────────────────────────────────╯',
+        '',
+        '⚠️ ملاحظة:',
+        '• لا يحذف رسائل المستخدمين',
+        '• فقط رسائل البوت فقط',
+      ]),
     };
   }
 
-  // Check if message is a reply to another message
+  // Check if message is a reply
   let targetMessageID = null;
-
   if (message?.messageReply?.messageID) {
     targetMessageID = String(message.messageReply.messageID);
   }
 
   if (targetMessageID) {
-    // Unsend the replied-to message
-    // Safety: FCA allows unsend only for bot's own messages.
-    // If it's not the bot's message, FCA will throw an error we catch.
     try {
       await api.unsend(targetMessageID);
-      return { type: 'reply', text: '✅ Message deleted.' };
-    } catch (err) {
-      const msg = String(err?.message || '').toLowerCase();
-      if (msg.includes('permission') || msg.includes('not your') || msg.includes('forbidden')) {
-        return {
-          type: 'reply',
-          text: '❌ Cannot delete this message — it\'s not the bot\'s message.',
-        };
-      }
       return {
         type: 'reply',
-        text: '❌ Failed to delete message. It may have already been deleted or the bot lacks permission.',
+        text: box('🗑️ تم الحذف', ['', 'تم حذف الرسالة بنجاح. ✅']),
+      };
+    } catch {
+      return {
+        type: 'reply',
+        text: box('❌ فشل الحذف', [
+          '',
+          'لا يمكن حذف هذه الرسالة.',
+          'قد تكون رسالة مستخدم أو تم حذفها مسبقاً.',
+        ]),
       };
     }
   }
 
-  // No reply — use last tracked bot message
+  // Use last tracked bot message
   const lastID = lastBotMessages.get(threadID);
   if (!lastID) {
     return {
       type: 'reply',
-      text: '❌ No bot message found to delete in this chat.',
+      text: box('🗑️ لا توجد رسالة', ['', 'لا توجد رسالة للبوت يمكن حذفها في هذا المحادثة.']),
     };
   }
 
   try {
     await api.unsend(lastID);
     lastBotMessages.delete(threadID);
-    return { type: 'reply', text: '✅ Message deleted.' };
-  } catch (err) {
-    const msg = String(err?.message || '').toLowerCase();
-    if (msg.includes('permission') || msg.includes('not your') || msg.includes('forbidden')) {
-      return {
-        type: 'reply',
-        text: '❌ Cannot delete — the last message may not be from the bot.',
-      };
-    }
     return {
       type: 'reply',
-      text: '❌ Failed to delete message. It may have already been deleted.',
+      text: box('🗑️ تم الحذف', ['', 'تم حذف آخر رسالة للبوت بنجاح. ✅']),
+    };
+  } catch {
+    return {
+      type: 'reply',
+      text: box('❌ فشل الحذف', ['', 'قد تكون الرسالة تم حذفها مسبقاً.']),
     };
   }
 }

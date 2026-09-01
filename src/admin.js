@@ -6,14 +6,6 @@
  *   Lv2 = Admin
  *   Lv3 = Senior Admin / Top Admin
  *
- * Usage:
- *   !addadmin <level> <user_id>     — Add user at level
- *   !addadmin <level>               — Add replied-to user at level
- *   !addadmin list                  — List all admins
- *   !addadmin list <level>          — List admins at level
- *   !addadmin remove <user_id>      — Remove admin
- *   !addadmin remove                — Remove replied-to admin
- *
  * Only Level 3 can add/modify/remove admins.
  */
 
@@ -22,156 +14,161 @@ import path from 'node:path';
 
 const ADMIN_FILE = path.resolve('data/admin-levels.json');
 
-const LEVELS = {
-  1: 'Junior',
-  2: 'Admin',
-  3: 'Senior Admin',
-};
-
+const LEVELS = { 1: 'Junior', 2: 'Admin', 3: 'Senior Admin' };
+const LEVEL_EMOJI = { 1: '🟢', 2: '🔵', 3: '🟡' };
 const MAX_LEVEL = 3;
 const MIN_LEVEL = 1;
 
-// In-memory store: { userId: levelNumber }
 let adminLevels = {};
+
+/* ── Persistence ──────────────────────────────────────── */
 
 export async function loadAdminLevels() {
   try {
     const saved = JSON.parse(await fs.readFile(ADMIN_FILE, 'utf8'));
     if (saved && typeof saved === 'object') adminLevels = saved;
-  } catch { /* no saved state */ }
+  } catch {}
   return { ...adminLevels };
 }
 
-export function getAdminLevels() {
-  return { ...adminLevels };
-}
-
-export function getAdminLevel(userId) {
-  if (!userId) return 0;
-  return adminLevels[String(userId).trim()] || 0;
-}
-
-export function isLevel3(userId) {
-  return getAdminLevel(userId) >= 3;
-}
-
-async function saveAdminLevels() {
+async function save() {
   await fs.mkdir(path.dirname(ADMIN_FILE), { recursive: true });
   await fs.writeFile(ADMIN_FILE, JSON.stringify(adminLevels, null, 2));
 }
 
-/**
- * Handle the !addadmin command.
- * @param {object} message - FCA messageCreate event
- * @param {object} api - FCA bot API
- * @returns {object} reply object
- */
+export function getAdminLevels() { return { ...adminLevels }; }
+export function getAdminLevel(userId) { return userId ? (adminLevels[String(userId).trim()] || 0) : 0; }
+export function isLevel3(userId) { return getAdminLevel(userId) >= 3; }
+
+/* ── Helpers ──────────────────────────────────────────── */
+
+function extractUserID(message) {
+  if (message?.messageReply?.senderID) return String(message.messageReply.senderID);
+  if (message?.mentions && Object.keys(message.mentions).length > 0) return Object.keys(message.mentions)[0];
+  return null;
+}
+
+function box(title, lines) {
+  const w = 34;
+  const border = '─'.repeat(w);
+  return [
+    `╭${border}╮`,
+    `│ ${title}`,
+    `╰${border}╯`,
+    ...lines,
+    '─'.repeat(w + 2),
+  ].join('\n');
+}
+
+/* ── Command Handler ──────────────────────────────────── */
+
 export async function handleAddAdmin(message, api) {
   const body = String(message?.body || '').trim();
-  const parts = body.split(/\s+/).slice(1); // remove "!addadmin"
+  const parts = body.split(/\s+/).slice(1);
   const sub = (parts[0] || '').toLowerCase();
   const senderID = String(message?.senderID || '');
 
-  // Check permission: must be Level 3
   if (!isLevel3(senderID)) {
     return {
       type: 'reply',
-      text: '⛔ This command requires Level 3 (Senior Admin) access.',
+      text: box('⛔ Access Denied', [
+        '',
+        'هذا الأمر مخصص لـ Level 3 فقط.',
+        'Level 3 = Senior Admin / Top Admin',
+        '',
+        'مستوى صلاحياتك الحالي: Lv' + getAdminLevel(senderID),
+      ]),
     };
   }
 
-  // !addadmin list [level]
-  if (sub === 'list') {
-    return handleList(parts.slice(1));
-  }
+  if (sub === 'list') return handleList(parts.slice(1));
+  if (sub === 'remove') return await handleRemove(parts.slice(1), message);
 
-  // !addadmin remove [user_id]
-  if (sub === 'remove') {
-    return await handleRemove(parts.slice(1), message);
-  }
-
-  // !addadmin <level> [user_id]
-  if (!sub) {
+  if (!sub || sub === 'help') {
     return {
       type: 'reply',
-      text: [
-        '📋 Usage:',
-        '!addadmin <1|2|3> <user_id> — Add user',
-        '!addadmin <1|2|3> — Add replied-to user',
-        '!addadmin list — List all admins',
-        '!addadmin list <level> — List by level',
-        '!addadmin remove <user_id> — Remove admin',
-      ].join('\n'),
+      text: box('📋 !addadmin — Guide', [
+        '',
+        '╭─── الإضافة ───────────────╮',
+        '│ !addadmin 1 @user         │',
+        '│ !addadmin 2 <ID>          │',
+        '│ !addadmin 3 <ID>          │',
+        '│ !addadmin 2 (رد على رسالة)│',
+        '╰───────────────────────────╯',
+        '',
+        '╭─── الإدارة ───────────────╮',
+        '│ !addadmin list            │',
+        '│ !addadmin list 2          │',
+        '│ !addadmin remove <ID>     │',
+        '│ !addadmin remove (رد)     │',
+        '╰───────────────────────────╯',
+        '',
+        'المستويات:',
+        '  🟢 Lv1 = Junior',
+        '  🔵 Lv2 = Admin',
+        '  🟡 Lv3 = Senior Admin',
+      ]),
     };
   }
 
-  // Parse level
   const level = parseInt(sub, 10);
   if (isNaN(level) || level < MIN_LEVEL || level > MAX_LEVEL) {
     return {
       type: 'reply',
-      text: `❌ Invalid level: "${sub}". Use 1, 2, or 3.`,
+      text: box('❌ خطأ', [
+        '',
+        `المستوى "${sub}" غير صحيح.`,
+        'استخدم: 1 أو 2 أو 3',
+      ]),
     };
   }
 
-  // Parse user ID
   let targetID = parts[1];
-
-  // If no ID provided, try reply
   if (!targetID) {
-    targetID = extractReplyUserID(message);
+    targetID = extractUserID(message);
     if (!targetID) {
       return {
         type: 'reply',
-        text: '❌ No user specified. Reply to a message or provide a User ID:\n!addadmin <1|2|3> <user_id>',
+        text: box('❌ لم يتم تحديد مستخدم', [
+          '',
+          'رد على رسالة المستخدم أو',
+          'أدخل User ID:',
+          `!addadmin ${level} <user_id>`,
+        ]),
       };
     }
   }
 
-  return await assignLevel(targetID, level, senderID);
+  return await assignLevel(targetID, level);
 }
 
-function extractReplyUserID(message) {
-  // Try standard FCA reply format
-  if (message?.messageReply?.senderID) {
-    return String(message.messageReply.senderID);
-  }
-  // Try mentions (first mention)
-  if (message?.mentions && Object.keys(message.mentions).length > 0) {
-    return Object.keys(message.mentions)[0];
-  }
-  return null;
-}
-
-function parseUserID(raw) {
-  if (!raw) return null;
-  const cleaned = String(raw).trim();
-  // If it starts with @, it's a mention - try to extract the ID
-  if (cleaned.startsWith('@')) {
-    // In FCA, mentions come as "Name" -> ID in message.mentions
-    // This won't work from plain text, so return null for bare @mentions
-    return null;
-  }
-  // Basic validation: should be numeric
-  if (/^\d{5,}$/.test(cleaned)) return cleaned;
-  return null;
-}
-
-async function assignLevel(targetID, level, assignerID) {
+async function assignLevel(targetID, level) {
   const prev = adminLevels[targetID];
   adminLevels[targetID] = level;
-  await saveAdminLevels();
+  await save();
 
-  const levelName = LEVELS[level];
+  const emoji = LEVEL_EMOJI[level];
+  const name = LEVELS[level];
+
   if (prev && prev !== level) {
     return {
       type: 'reply',
-      text: `✅ User ${targetID} upgraded from Lv${prev} (${LEVELS[prev]}) to Lv${level} (${levelName}).`,
+      text: box('✅ تم الترقية', [
+        '',
+        `المستخدم: ${targetID}`,
+        `من: Lv${prev} (${LEVELS[prev]})`,
+        `إلى: ${emoji} Lv${level} (${name})`,
+      ]),
     };
   }
+
   return {
     type: 'reply',
-    text: `✅ User ${targetID} added as Lv${level} (${levelName}).`,
+    text: box('✅ تم الإضافة', [
+      '',
+      `المستخدم: ${targetID}`,
+      `ال级别: ${emoji} Lv${level} (${name})`,
+    ]),
   };
 }
 
@@ -180,42 +177,46 @@ function handleList(levelArgs) {
   const entries = Object.entries(adminLevels);
 
   if (entries.length === 0) {
-    return { type: 'reply', text: '📋 No admins registered yet.' };
+    return {
+      type: 'reply',
+      text: box('📋 قائمة الأدمنز', ['', 'لا يوجد أي أدمن مسجل حالياً.']),
+    };
   }
 
-  const filtered = level
-    ? entries.filter(([, l]) => l === level)
-    : entries;
+  const filtered = level ? entries.filter(([, l]) => l === level) : entries;
 
   if (filtered.length === 0) {
     return {
       type: 'reply',
-      text: level
-        ? `📋 No admins at Level ${level}.`
-        : '📋 No admins registered yet.',
+      text: box('📋 قائمة الأدمنز', ['', `لا يوجد أدمنز في المستوى ${level}.`]),
     };
   }
 
-  const lines = filtered
-    .sort((a, b) => b[1] - a[1]) // highest level first
-    .map(([id, lvl]) => `• ${id} — Lv${lvl} (${LEVELS[lvl]})`);
+  const lines = ['', ...filtered
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, lvl]) => `${LEVEL_EMOJI[lvl]} Lv${lvl} — ${id}`),
+  ];
 
-  const header = level
-    ? `📋 Level ${level} (${LEVELS[level]}):`
-    : '📋 All Admins:';
+  const title = level
+    ? `📋 المستوى ${level} (${LEVELS[level]})`
+    : '📋 جميع الأدمنز';
 
-  return { type: 'reply', text: [header, ...lines].join('\n') };
+  return { type: 'reply', text: box(title, lines) };
 }
 
 async function handleRemove(parts, message) {
   let targetID = parts[0] || null;
-
   if (!targetID) {
-    targetID = extractReplyUserID(message);
+    targetID = extractUserID(message);
     if (!targetID) {
       return {
         type: 'reply',
-        text: '❌ No user specified. Reply to a message or provide a User ID:\n!addadmin remove <user_id>',
+        text: box('❌ لم يتم تحديد مستخدم', [
+          '',
+          'رد على رسالة المستخدم أو',
+          'أدخل User ID:',
+          '!addadmin remove <user_id>',
+        ]),
       };
     }
   }
@@ -224,16 +225,23 @@ async function handleRemove(parts, message) {
   if (!adminLevels[cleaned]) {
     return {
       type: 'reply',
-      text: `❌ User ${cleaned} is not a registered admin.`,
+      text: box('❌ غير موجود', [
+        '',
+        `المستخدم ${cleaned} ليس أدمناً مسجلاً.`,
+      ]),
     };
   }
 
   const prevLevel = adminLevels[cleaned];
   delete adminLevels[cleaned];
-  await saveAdminLevels();
+  await save();
 
   return {
     type: 'reply',
-    text: `✅ User ${cleaned} removed from Lv${prevLevel} (${LEVELS[prevLevel]}).`,
+    text: box('🗑️ تم الإزالة', [
+      '',
+      `المستخدم: ${cleaned}`,
+      `كان في: Lv${prevLevel} (${LEVELS[prevLevel]})`,
+    ]),
   };
 }
