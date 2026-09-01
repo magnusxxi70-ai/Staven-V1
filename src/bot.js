@@ -2,6 +2,8 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const fca = require('@dongdev/fca-unofficial');
 const { createMessengerBot } = fca;
+import { hasPermission, getUserRole, getRoles } from './roles.js';
+import { addUserToStage, commitPendingRoles } from './roles.js';
 
 let bot = null;
 let botApi = null;
@@ -37,10 +39,63 @@ export async function startBot(appStateArray) {
       botState.lastDisconnected = new Date().toISOString();
     });
 
-    bot.on('messageCreate', (event) => {
+    bot.on('messageCreate', async (event) => {
       const body = String(event?.body || '').trim();
       const threadID = String(event?.threadID || '');
+      const senderID = String(event?.senderID || '');
       if (!threadID || !body.startsWith('!')) return;
+
+      // ── !ستافين اضافة ادمن ──────────────────────────
+      if (body === '!ستافين اضافة ادمن' || body === '!ستافين اضافة ادمن ') {
+        if (!hasPermission(senderID, 'superAdmin')) {
+          try { botApi.sendMessage('\u274C هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
+          return;
+        }
+
+        const targetID = event?.messageReply?.senderID ? String(event.messageReply.senderID) : null;
+        if (!targetID) {
+          try { botApi.sendMessage('\u274C يجب الرد على رسالة الشخص الذي تريد إضافته كـ Super Admin.', threadID); } catch {}
+          return;
+        }
+
+        if (targetID === senderID) {
+          try { botApi.sendMessage('\u274C لا يمكنك إضافة نفسك كـ Super Admin.', threadID); } catch {}
+          return;
+        }
+
+        const existing = getUserRole(targetID);
+        if (existing) {
+          try { botApi.sendMessage(`\u274C هذا الشخص بالفعل صلاحيته: ${existing}`, threadID); } catch {}
+          return;
+        }
+
+        const r = addUserToStage(targetID, 'superAdmin');
+        if (!r.ok) {
+          try { botApi.sendMessage(`\u274C خطأ: ${r.error}`, threadID); } catch {}
+          return;
+        }
+
+        await commitPendingRoles();
+
+        const bar = '\u2500'.repeat(32);
+        const msg = [
+          `\u256D\u2500\u3010 \U0001F451 STAVEN BLUE V1 \u3011\u2500\u256E`,
+          '\u2502',
+          '\u2502 \u2705 \u062A\u0645 \u0625\u0636\u0627\u0641\u0629 Super Admin \u0628\u0646\u062C\u0627\u062D',
+          '\u2502',
+          `\u2502 \U0001F464 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645: ${targetID}`,
+          `\u2502 \U0001F194 ID: ${targetID}`,
+          '\u2502 \U0001F6E1\uFE0F \u0627\u0644\u0635\u0644\u0627\u062D\u064A\u0629: Super Admin',
+          '\u2502',
+          '\u2502 \u26A1 \u0627\u0635\u0628\u062D\u062A \u0644\u0647 \u0635\u0644\u0627\u062D\u064A\u0629 Super Admin',
+          '\u2502',
+          `\u2570${bar}\u256F`,
+          '\U0001F451 Developer: Magnus',
+        ].join('\n');
+
+        try { botApi.sendMessage(msg, threadID); } catch {}
+        return;
+      }
 
       const cmd = body.split(/\s+/)[0].toLowerCase();
 
