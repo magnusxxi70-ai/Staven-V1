@@ -38,8 +38,39 @@ export async function startBot(appStateArray) {
     });
 
     bot.on('messageCreate', (event) => {
-      // Message handler — commands removed
-      // Future commands can be added here
+      const body = String(event?.body || '').trim();
+      const threadID = String(event?.threadID || '');
+      if (!threadID || !body.startsWith('!')) return;
+
+      const cmd = body.split(/\s+/)[0].toLowerCase();
+
+      // ── !uptime ──────────────────────────────────────
+      if (cmd === '!uptime') {
+        const totalSec = Math.floor(process.uptime());
+        const days = Math.floor(totalSec / 86400);
+        const hours = Math.floor((totalSec % 86400) / 3600);
+        const minutes = Math.floor((totalSec % 3600) / 60);
+        const seconds = totalSec % 60;
+
+        const bar = '─'.repeat(32);
+        const msg = [
+          `╭${bar}╮`,
+          '│ ⚡ STAVEN BLUE V1',
+          '│',
+          '│ ⏱️ مدة التشغيل:',
+          `│ 📅 الأيام: ${days}`,
+          `│ 🕐 الساعات: ${hours}`,
+          `│ ⏳ الدقائق: ${minutes}`,
+          `│ ⚡ الثواني: ${seconds}`,
+          '│',
+          '│ 🤖 النظام: Staven Blue V1',
+          '│ 👑 المطور: Magnus',
+          '│',
+          `╰${bar}╯`,
+        ].join('\n');
+
+        try { botApi.sendMessage(msg, threadID); } catch {}
+      }
     });
 
     botState.status = 'connected';
