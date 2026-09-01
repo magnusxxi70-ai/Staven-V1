@@ -4,7 +4,7 @@ import path from 'node:path';
 const require = createRequire(import.meta.url);
 const fca = require('@dongdev/fca-unofficial');
 const { createMessengerBot } = fca;
-import { hasPermission, getUserRole } from './roles.js';
+import { hasPermission } from './roles.js';
 import { addUserToStage, commitPendingRoles } from './roles.js';
 
 /* ── Bot Core ─────────────────────────────────────────── */
@@ -26,21 +26,39 @@ export function getBotApi() { return botApi; }
 
 const AUTO_MSG_FILE = path.resolve('data/auto-messaging.json');
 
-// Per-thread state: { threadID: { message, interval, sentCount, active, timer } }
+// Per-thread state: { threadID: { message, interval, sentCount, active, paused, timer } }
 const autoStates = {};
 
 /**
- * Parse duration string like "1ث" to seconds.
+ * Parse duration string to seconds.
+ * Supports: 1ث, 2ث, 5ث, 10ث, 30ث, 60ث, 1s, 2s, 5s, 10s, 30s, 60s, or plain numbers.
  */
 function parseDuration(raw) {
   if (!raw) return null;
   const cleaned = raw.trim();
-  // Match: digits + ث
-  const m = cleaned.match(/^(\d+)[\u0629\u062B]?$/);
-  if (m) return parseInt(m[1], 10);
+  // Match: digits + ث (Arabic tha)
+  const mArabic = cleaned.match(/^(\d+)[\u0629\u062B]?$/);
+  if (mArabic) return parseInt(mArabic[1], 10);
+  // Match: digits + s (English)
+  const mEnglish = cleaned.match(/^(\d+)s$/i);
+  if (mEnglish) return parseInt(mEnglish[1], 10);
   // Match: digits only
   if (/^\d+$/.test(cleaned)) return parseInt(cleaned, 10);
   return null;
+}
+
+/**
+ * Unsend a message if possible.
+ */
+async function tryUnsend(messageID) {
+  if (!messageID || !botApi) return;
+  try {
+    if (typeof botApi.unsendMessage === 'function') {
+      await botApi.unsendMessage(messageID);
+    } else if (typeof botApi.unsend === 'function') {
+      await botApi.unsend(messageID);
+    }
+  } catch {}
 }
 
 /**
@@ -152,7 +170,6 @@ async function loadAutoState() {
     for (const [tid, data] of Object.entries(saved)) {
       if (data.active || data.paused) {
         autoStates[tid] = { ...data, timer: null };
-        // Only resume if it was active (not paused)
         if (data.active && !data.paused) {
           scheduleNext(tid);
           console.log(`[AUTO-MSG] Restored active auto-msg in ${tid}`);
@@ -205,14 +222,15 @@ export async function startBot(appStateArray) {
       const body = String(event?.body || '').trim();
       const threadID = String(event?.threadID || '');
       const senderID = String(event?.senderID || '');
+      const messageID = String(event?.messageID || '');
       if (!threadID) return;
 
       // ── Monitor human messages to resume auto-messaging ──
-      // Non-command messages from non-bot users resume auto-messaging
-      if (body && senderID && !body.startsWith('!')) {
+      if (body && senderID) {
         const botID = String(event?.botID || '');
         const isBot = senderID === '0' || senderID === botID;
-        if (!isBot && autoStates[threadID]?.paused) {
+        // Only non-bot, non-command messages count as human interaction
+        if (!isBot && !body.startsWith('!') && autoStates[threadID]?.paused) {
           resumeAuto(threadID);
         }
       }
@@ -221,13 +239,14 @@ export async function startBot(appStateArray) {
 
       // ── !ستافين (help) ─────────────────────────────────
       if (body === '!ستافين' || body === '!ستافين ') {
-        const msg = box('🔵 STAVEN BLUE V1', [
+        const msg = box('STAVEN BLUE V1', [
           '⚙️ نظام الرسائل التلقائية',
           '',
-          '!ستافين بدأ [الرسالة] [المدة]',
+          '!ستافين تشغيل [الرسالة] [المدة]',
           '',
           'مثال:',
-          '!ستافين بدأ ككك 1ث',
+          '!ستافين تشغيل ككك 1ث',
+          '!ستافين تشغيل هلا 5s',
           '',
           '🛑 للإيقاف:',
           '!ستافين ايقاف',
@@ -251,26 +270,28 @@ export async function startBot(appStateArray) {
         }
 
         const stopped = stopAuto(threadID);
-        const msg = box('🔵 STAVEN BLUE V1', [
-          stopped ? '🛑 تم إيقاف الرسائل التلقائية.' : '⚠️ لا توجد رسائل تلقائية نشطة.',
+        const msg = box('STAVEN BLUE V1', [
+          stopped ? '🛑 تم إيقاف النظام التلقائي.' : '⚠️ لا يوجد نظام تلقائي نشط.',
           '',
           '⚙️ الحالة: متوقف',
           '👑 المطور: Magnus',
         ]);
         try { botApi.sendMessage(msg, threadID); } catch {}
+        // Delete the command message
+        tryUnsend(messageID);
         return;
       }
 
-      // ── !ستافين بدأ [message] [duration] ───────────────
-      if (body.startsWith('!ستافين بدأ')) {
+      // ── !ستافين تشغيل [message] [duration] ─────────────
+      if (body.startsWith('!ستافين تشغيل')) {
         if (!hasPermission(senderID, 'superAdmin')) {
           try { botApi.sendMessage('❌ هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
           return;
         }
 
-        const args = body.slice('!ستافين بدأ'.length).trim();
+        const args = body.slice('!ستافين تشغيل'.length).trim();
         if (!args) {
-          try { botApi.sendMessage('❌ يرجى كتابة الرسالة والمدة.\nمثال: !ستافين بدأ ككك 1ث', threadID); } catch {}
+          try { botApi.sendMessage('❌ يرجى كتابة الرسالة والمدة.\nمثال: !ستافين تشغيل ككك 1ث', threadID); } catch {}
           return;
         }
 
@@ -280,29 +301,31 @@ export async function startBot(appStateArray) {
         const interval = parseDuration(durationRaw);
 
         if (!interval || interval < 1) {
-          try { botApi.sendMessage('❌ المدة غير صحيحة. استخدم: 1ث, 2ث, 5ث, 10ث, إلخ.', threadID); } catch {}
+          try { botApi.sendMessage('❌ المدة غير صحيحة. استخدم: 1ث, 2s, 5ث, 10s, إلخ.', threadID); } catch {}
           return;
         }
 
         // Message is everything except the last token
         const message = parts.slice(0, -1).join(' ').trim();
         if (!message) {
-          try { botApi.sendMessage('❌ يرجى كتابة الرسالة.\nمثال: !ستافين بدأ ككك 1ث', threadID); } catch {}
+          try { botApi.sendMessage('❌ يرجى كتابة الرسالة.\nمثال: !ستافين تشغيل ككك 1ث', threadID); } catch {}
           return;
         }
 
         await startAuto(threadID, message, interval);
 
-        const msg = box('🔵 STAVEN BLUE V1', [
-          '✅ تم تشغيل الرسائل التلقائية',
+        const msg = box('STAVEN BLUE V1', [
+          '✅ تم تشغيل النظام بنجاح',
           '',
           `📝 الرسالة: ${message}`,
-          `⏱️ الفاصل: كل ${interval} ثانية`,
-          '⚙️ النظام: إرسال تلقائي متتابع',
+          `⏱️ الفاصل: ${interval} ثانية`,
+          '⚙️ طبيعة الأمر: إرسال تلقائي متكرر',
           '',
           '👑 المطور: Magnus',
         ]);
         try { botApi.sendMessage(msg, threadID); } catch {}
+        // Delete the command message
+        tryUnsend(messageID);
         return;
       }
 
