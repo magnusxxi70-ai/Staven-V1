@@ -1,15 +1,19 @@
 import { createRequire } from 'node:module';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 const require = createRequire(import.meta.url);
 const fca = require('@dongdev/fca-unofficial');
 const { createMessengerBot } = fca;
-import { hasPermission, getUserRole, getRoles } from './roles.js';
+import { hasPermission, getUserRole } from './roles.js';
 import { addUserToStage, commitPendingRoles } from './roles.js';
+
+/* ── Bot Core ─────────────────────────────────────────── */
 
 let bot = null;
 let botApi = null;
 
 let botState = {
-  status: 'disconnected', // connecting | connected | disconnected | error
+  status: 'disconnected',
   lastConnected: null,
   lastDisconnected: null,
   lastError: null,
@@ -17,6 +21,161 @@ let botState = {
 
 export function getBotState() { return { ...botState }; }
 export function getBotApi() { return botApi; }
+
+/* ── Auto-Messaging State ─────────────────────────────── */
+
+const AUTO_MSG_FILE = path.resolve('data/auto-messaging.json');
+
+// Per-thread state: { threadID: { message, interval, sentCount, active, timer } }
+const autoStates = {};
+
+/**
+ * Parse duration string like "1ث" to seconds.
+ */
+function parseDuration(raw) {
+  if (!raw) return null;
+  const cleaned = raw.trim();
+  // Match: digits + ث
+  const m = cleaned.match(/^(\d+)[\u0629\u062B]?$/);
+  if (m) return parseInt(m[1], 10);
+  // Match: digits only
+  if (/^\d+$/.test(cleaned)) return parseInt(cleaned, 10);
+  return null;
+}
+
+/**
+ * Schedule next auto-send for a thread.
+ */
+function scheduleNext(threadID) {
+  const state = autoStates[threadID];
+  if (!state || !state.active) return;
+
+  state.timer = setTimeout(async () => {
+    if (!state.active || !botApi) return;
+
+    try {
+      await botApi.sendMessage(state.message, threadID);
+      state.sentCount++;
+    } catch (err) {
+      console.error(`[AUTO-MSG] Send failed in ${threadID}:`, err?.message);
+    }
+
+    // Smart stop: after 2 messages, pause
+    if (state.sentCount >= 2) {
+      state.active = false;
+      state.paused = true;
+      console.log(`[AUTO-MSG] Paused in ${threadID} after 2 messages`);
+      await saveAutoState();
+      return;
+    }
+
+    // Continue sending
+    scheduleNext(threadID);
+  }, state.interval * 1000);
+
+  if (state.timer?.unref) state.timer.unref();
+}
+
+/**
+ * Resume auto-messaging for a thread (called on human message).
+ */
+function resumeAuto(threadID) {
+  const state = autoStates[threadID];
+  if (!state || !state.active || !state.paused) return;
+
+  state.active = true;
+  state.paused = false;
+  state.sentCount = 0;
+  console.log(`[AUTO-MSG] Resumed in ${threadID}`);
+  scheduleNext(threadID);
+  saveAutoState().catch(() => {});
+}
+
+/**
+ * Stop auto-messaging for a thread.
+ */
+function stopAuto(threadID) {
+  const state = autoStates[threadID];
+  if (!state) return false;
+
+  if (state.timer) clearTimeout(state.timer);
+  delete autoStates[threadID];
+  console.log(`[AUTO-MSG] Stopped in ${threadID}`);
+  saveAutoState().catch(() => {});
+  return true;
+}
+
+/**
+ * Start auto-messaging for a thread.
+ */
+async function startAuto(threadID, message, interval) {
+  // Stop existing timer if any
+  if (autoStates[threadID]?.timer) clearTimeout(autoStates[threadID].timer);
+
+  autoStates[threadID] = {
+    message,
+    interval,
+    sentCount: 0,
+    active: true,
+    paused: false,
+    startedAt: Date.now(),
+  };
+
+  console.log(`[AUTO-MSG] Started in ${threadID}: "${message}" every ${interval}s`);
+  scheduleNext(threadID);
+  await saveAutoState();
+}
+
+/* ── Persistence ──────────────────────────────────────── */
+
+async function saveAutoState() {
+  try {
+    await fs.mkdir(path.dirname(AUTO_MSG_FILE), { recursive: true });
+    const saveData = {};
+    for (const [tid, s] of Object.entries(autoStates)) {
+      saveData[tid] = {
+        message: s.message,
+        interval: s.interval,
+        sentCount: s.sentCount,
+        active: s.active,
+        paused: s.paused,
+        startedAt: s.startedAt,
+      };
+    }
+    await fs.writeFile(AUTO_MSG_FILE, JSON.stringify(saveData, null, 2));
+  } catch {}
+}
+
+async function loadAutoState() {
+  try {
+    const saved = JSON.parse(await fs.readFile(AUTO_MSG_FILE, 'utf8'));
+    for (const [tid, data] of Object.entries(saved)) {
+      if (data.active || data.paused) {
+        autoStates[tid] = { ...data, timer: null };
+        // Only resume if it was active (not paused)
+        if (data.active && !data.paused) {
+          scheduleNext(tid);
+          console.log(`[AUTO-MSG] Restored active auto-msg in ${tid}`);
+        }
+      }
+    }
+  } catch {}
+}
+
+function cleanupAutoTimers() {
+  for (const s of Object.values(autoStates)) {
+    if (s.timer) clearTimeout(s.timer);
+  }
+}
+
+/* ── Command Helpers ──────────────────────────────────── */
+
+function box(title, lines) {
+  const bar = '─'.repeat(32);
+  return [`╭${bar}╮`, `│ ${title}`, '│', ...lines, `╰${bar}╯`].join('\n');
+}
+
+/* ── Start Bot ────────────────────────────────────────── */
 
 export async function startBot(appStateArray) {
   if (bot) { try { await stopBot(); } catch {} }
@@ -32,6 +191,9 @@ export async function startBot(appStateArray) {
 
     botApi = bot.api || bot;
 
+    // Load saved auto-messaging states
+    await loadAutoState();
+
     bot.on('error', (err) => {
       console.error('[BOT] Error:', err?.message || err);
       botState.status = 'error';
@@ -43,63 +205,109 @@ export async function startBot(appStateArray) {
       const body = String(event?.body || '').trim();
       const threadID = String(event?.threadID || '');
       const senderID = String(event?.senderID || '');
-      if (!threadID || !body.startsWith('!')) return;
+      if (!threadID) return;
 
-      // ── !ستافين اضافة ادمن ──────────────────────────
-      if (body === '!ستافين اضافة ادمن' || body === '!ستافين اضافة ادمن ') {
-        if (!hasPermission(senderID, 'superAdmin')) {
-          try { botApi.sendMessage('\u274C هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
-          return;
+      // ── Monitor human messages to resume auto-messaging ──
+      // Non-command messages from non-bot users resume auto-messaging
+      if (body && senderID && !body.startsWith('!')) {
+        const botID = String(event?.botID || '');
+        const isBot = senderID === '0' || senderID === botID;
+        if (!isBot && autoStates[threadID]?.paused) {
+          resumeAuto(threadID);
         }
+      }
 
-        const targetID = event?.messageReply?.senderID ? String(event.messageReply.senderID) : null;
-        if (!targetID) {
-          try { botApi.sendMessage('\u274C يجب الرد على رسالة الشخص الذي تريد إضافته كـ Super Admin.', threadID); } catch {}
-          return;
-        }
+      if (!body.startsWith('!')) return;
 
-        if (targetID === senderID) {
-          try { botApi.sendMessage('\u274C لا يمكنك إضافة نفسك كـ Super Admin.', threadID); } catch {}
-          return;
-        }
-
-        const existing = getUserRole(targetID);
-        if (existing) {
-          try { botApi.sendMessage(`\u274C هذا الشخص بالفعل صلاحيته: ${existing}`, threadID); } catch {}
-          return;
-        }
-
-        const r = addUserToStage(targetID, 'superAdmin');
-        if (!r.ok) {
-          try { botApi.sendMessage(`\u274C خطأ: ${r.error}`, threadID); } catch {}
-          return;
-        }
-
-        await commitPendingRoles();
-
-        const bar = '\u2500'.repeat(32);
-        const msg = [
-          `\u256D\u2500\u3010 \U0001F451 STAVEN BLUE V1 \u3011\u2500\u256E`,
-          '\u2502',
-          '\u2502 \u2705 \u062A\u0645 \u0625\u0636\u0627\u0641\u0629 Super Admin \u0628\u0646\u062C\u0627\u062D',
-          '\u2502',
-          `\u2502 \U0001F464 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645: ${targetID}`,
-          `\u2502 \U0001F194 ID: ${targetID}`,
-          '\u2502 \U0001F6E1\uFE0F \u0627\u0644\u0635\u0644\u0627\u062D\u064A\u0629: Super Admin',
-          '\u2502',
-          '\u2502 \u26A1 \u0627\u0635\u0628\u062D\u062A \u0644\u0647 \u0635\u0644\u0627\u062D\u064A\u0629 Super Admin',
-          '\u2502',
-          `\u2570${bar}\u256F`,
-          '\U0001F451 Developer: Magnus',
-        ].join('\n');
-
+      // ── !ستافين (help) ─────────────────────────────────
+      if (body === '!ستافين' || body === '!ستافين ') {
+        const msg = box('🔵 STAVEN BLUE V1', [
+          '⚙️ نظام الرسائل التلقائية',
+          '',
+          '!ستافين بدأ [الرسالة] [المدة]',
+          '',
+          'مثال:',
+          '!ستافين بدأ ككك 1ث',
+          '',
+          '🛑 للإيقاف:',
+          '!ستافين ايقاف',
+          '',
+          '📌 النظام:',
+          'يرسل رسالتين تلقائيتين، ثم يتوقف',
+          'حتىتحدث أحد أعضاء الغروب،',
+          'وبعدها يستأنف ويرسل رسالتين من جديد.',
+          '',
+          '👑 المطور: Magnus',
+        ]);
         try { botApi.sendMessage(msg, threadID); } catch {}
         return;
       }
 
-      const cmd = body.split(/\s+/)[0].toLowerCase();
+      // ── !ستافين ايقاف ──────────────────────────────────
+      if (body === '!ستافين ايقاف' || body === '!ستافين ايقاف ') {
+        if (!hasPermission(senderID, 'superAdmin')) {
+          try { botApi.sendMessage('❌ هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
+          return;
+        }
+
+        const stopped = stopAuto(threadID);
+        const msg = box('🔵 STAVEN BLUE V1', [
+          stopped ? '🛑 تم إيقاف الرسائل التلقائية.' : '⚠️ لا توجد رسائل تلقائية نشطة.',
+          '',
+          '⚙️ الحالة: متوقف',
+          '👑 المطور: Magnus',
+        ]);
+        try { botApi.sendMessage(msg, threadID); } catch {}
+        return;
+      }
+
+      // ── !ستافين بدأ [message] [duration] ───────────────
+      if (body.startsWith('!ستافين بدأ')) {
+        if (!hasPermission(senderID, 'superAdmin')) {
+          try { botApi.sendMessage('❌ هذا الأمر متاح فقط لـ Owner / Super Admin.', threadID); } catch {}
+          return;
+        }
+
+        const args = body.slice('!ستافين بدأ'.length).trim();
+        if (!args) {
+          try { botApi.sendMessage('❌ يرجى كتابة الرسالة والمدة.\nمثال: !ستافين بدأ ككك 1ث', threadID); } catch {}
+          return;
+        }
+
+        // Extract duration (last token)
+        const parts = args.split(/\s+/);
+        const durationRaw = parts[parts.length - 1];
+        const interval = parseDuration(durationRaw);
+
+        if (!interval || interval < 1) {
+          try { botApi.sendMessage('❌ المدة غير صحيحة. استخدم: 1ث, 2ث, 5ث, 10ث, إلخ.', threadID); } catch {}
+          return;
+        }
+
+        // Message is everything except the last token
+        const message = parts.slice(0, -1).join(' ').trim();
+        if (!message) {
+          try { botApi.sendMessage('❌ يرجى كتابة الرسالة.\nمثال: !ستافين بدأ ككك 1ث', threadID); } catch {}
+          return;
+        }
+
+        await startAuto(threadID, message, interval);
+
+        const msg = box('🔵 STAVEN BLUE V1', [
+          '✅ تم تشغيل الرسائل التلقائية',
+          '',
+          `📝 الرسالة: ${message}`,
+          `⏱️ الفاصل: كل ${interval} ثانية`,
+          '⚙️ النظام: إرسال تلقائي متتابع',
+          '',
+          '👑 المطور: Magnus',
+        ]);
+        try { botApi.sendMessage(msg, threadID); } catch {}
+        return;
+      }
 
       // ── !uptime ──────────────────────────────────────
+      const cmd = body.split(/\s+/)[0].toLowerCase();
       if (cmd === '!uptime') {
         const totalSec = Math.floor(process.uptime());
         const days = Math.floor(totalSec / 86400);
@@ -142,6 +350,7 @@ export async function startBot(appStateArray) {
 }
 
 export async function stopBot() {
+  cleanupAutoTimers();
   if (bot) {
     try {
       if (typeof bot.stop === 'function') bot.stop();
