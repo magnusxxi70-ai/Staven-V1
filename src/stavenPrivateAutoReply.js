@@ -2,18 +2,18 @@
 
 /**
  * ══════════════════════════════════════════════════════════
- * STAVEN PRIVATE AUTO REPLY V1
+ * STAVEN AUTO REPLY V2
  * Developer: Magnus
  * Bot: Staven Blue V1
  * ══════════════════════════════════════════════════════════
  *
- * Independent DM auto-reply system.
- * - DM only (not groups)
- * - Continuous auto-reply (NO auto-stop — runs until !ستافين ايقاف)
+ * Independent auto-reply system with custom messages and intervals.
+ * - Custom message + custom interval (ث/د/س)
+ * - Continuous sending (NO auto-stop — runs until !ستافين ايقاف)
  * - Per-thread independent state
  * - Persistent across restarts
- * - Permission-gated: only Owner + Admins receive auto-replies
- * - Dedup: each message processed only once
+ * - Permission-gated: only Owner + Admins
+ * - Single instance per thread (no duplicates)
  * - Commands: !ستافين / !ستافين تشغيل / !ستافين ايقاف / !ستافين حالة
  */
 
@@ -21,29 +21,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 /* ══════════════════════════════════════════════════════════
-   CONFIGURATION — Edit these values easily
+   DATA FILE
    ══════════════════════════════════════════════════════════ */
 
-/** Auto-reply message sent continuously */
-const AUTO_MESSAGE = "ككك";
-
-/** Interval between auto-replies in milliseconds (1000 = 1 second) */
-const AUTO_REPLY_INTERVAL = 1000;
-
-/** Data file path for persistence */
 const DATA_FILE = path.resolve('data/stavenPrivateAutoReply.json');
 
 /* ══════════════════════════════════════════════════════════
-   STATE MANAGEMENT
+   STATE — one per thread
    ══════════════════════════════════════════════════════════ */
 
-// Per-thread state: { active: boolean }
 const state = {};
-
-// Per-thread timers (not persisted — recreated on load)
 const timers = {};
-
-// Single reference for the send function (set during init)
 let _sendFn = null;
 
 /* ══════════════════════════════════════════════════════════
@@ -51,19 +39,13 @@ let _sendFn = null;
    ══════════════════════════════════════════════════════════ */
 
 const processedMsgIds = new Set();
-const DEDUP_TTL = 5 * 60 * 1000; // 5 minutes
+const DEDUP_TTL = 5 * 60 * 1000;
 
-/**
- * Check if a message has already been processed.
- */
 export function isMessageProcessed(messageID) {
   if (!messageID) return false;
   return processedMsgIds.has(messageID);
 }
 
-/**
- * Mark a message as processed. Auto-cleans after TTL.
- */
 export function markMessageProcessed(messageID) {
   if (!messageID) return;
   processedMsgIds.add(messageID);
@@ -76,35 +58,55 @@ export function markMessageProcessed(messageID) {
 
 let _checkPerm = null;
 
-/**
- * Set the permission check function.
- * @param {Function} fn - async (userId, level) => boolean
- */
 export function setPermissionChecker(fn) {
   _checkPerm = fn;
 }
 
-/**
- * Check if user is allowed (Owner / Super Admin / Admin).
- */
-async function isStavenAllowed(userId) {
-  if (!userId) return false;
-  if (_checkPerm) {
-    return await _checkPerm(userId, 'admin');
+/* ══════════════════════════════════════════════════════════
+   TIME UNIT PARSING
+   ══════════════════════════════════════════════════════════ */
+
+function parseDuration(str) {
+  if (!str) return null;
+  str = str.trim();
+  const match = str.match(/^([\d.]+)\s*(ث|د|س)$/);
+  if (!match) return null;
+  const num = parseFloat(match[1]);
+  if (isNaN(num) || num <= 0) return null;
+  const unit = match[2];
+  if (unit === 'ث') return num * 1000;
+  if (unit === 'د') return num * 60 * 1000;
+  if (unit === 'س') return num * 3600 * 1000;
+  return null;
+}
+
+function formatInterval(ms) {
+  if (ms >= 3600000) {
+    const h = ms / 3600000;
+    return `${h} ${h === 1 ? 'ساعة' : 'ساعات'}`;
   }
-  return false;
+  if (ms >= 60000) {
+    const m = ms / 60000;
+    return `${m} ${m === 1 ? 'دقيقة' : 'دقائق'}`;
+  }
+  const s = ms / 1000;
+  return `${s} ${s === 1 ? 'ثانية' : 'ثواني'}`;
 }
 
 /* ══════════════════════════════════════════════════════════
    PERSISTENCE
    ══════════════════════════════════════════════════════════ */
 
-async function saveData() {
+let _pendingSave = Promise.resolve();
+
+async function _doSave() {
   try {
     await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
     const out = {};
     for (const [tid, s] of Object.entries(state)) {
-      out[tid] = { active: s.active };
+      if (s.active) {
+        out[tid] = { active: true, message: s.message, intervalMs: s.intervalMs };
+      }
     }
     await fs.writeFile(DATA_FILE, JSON.stringify(out, null, 2));
   } catch (err) {
@@ -112,12 +114,23 @@ async function saveData() {
   }
 }
 
+function scheduleSave() {
+  _pendingSave = _doSave();
+}
+
+/** Wait for the latest save to complete (useful in tests). */
+export async function waitForSave() {
+  await _pendingSave;
+}
+
 async function loadData() {
   try {
     const raw = await fs.readFile(DATA_FILE, 'utf8');
     const saved = JSON.parse(raw);
     for (const [tid, data] of Object.entries(saved)) {
-      state[tid] = { active: !!data.active };
+      if (data.active && data.message && data.intervalMs) {
+        state[tid] = { active: true, message: data.message, intervalMs: data.intervalMs };
+      }
     }
   } catch {
     // No data file yet
@@ -125,34 +138,33 @@ async function loadData() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   TIMER / SCHEDULER MANAGEMENT
+   TIMER / SCHEDULER
    ══════════════════════════════════════════════════════════ */
 
-function startScheduler(threadID, sendFn) {
-  // CRITICAL: Prevent duplicate timers
+function startScheduler(threadID) {
   if (timers[threadID]) return;
+  const s = state[threadID];
+  if (!s?.active) return;
 
   const loop = async () => {
     if (!state[threadID]?.active) {
       delete timers[threadID];
       return;
     }
-
     try {
-      await sendFn(AUTO_MESSAGE, threadID);
+      await _sendFn(state[threadID].message, threadID);
     } catch (err) {
       console.error(`[STAVEN-PRIVATE] Send failed in ${threadID}:`, err?.message);
     }
-
     if (state[threadID]?.active) {
-      timers[threadID] = setTimeout(loop, AUTO_REPLY_INTERVAL);
+      timers[threadID] = setTimeout(loop, state[threadID].intervalMs);
       if (timers[threadID]?.unref) timers[threadID].unref();
     } else {
       delete timers[threadID];
     }
   };
 
-  timers[threadID] = setTimeout(loop, AUTO_REPLY_INTERVAL);
+  timers[threadID] = setTimeout(loop, s.intervalMs);
   if (timers[threadID]?.unref) timers[threadID].unref();
 }
 
@@ -177,7 +189,7 @@ function cleanupAll() {
 function isDM(event, senderID, threadID) {
   if (event?.isGroup === true) return false;
   if (event?.threadType === 'group') return false;
-  if (senderID === '0') return true; // self-messages are DM
+  if (senderID === '0') return true;
   return threadID === senderID;
 }
 
@@ -190,22 +202,13 @@ function box(title, lines) {
   return [`╭${bar}╮`, `│ ${title}`, '│', ...lines, `╰${bar}╯`].join('\n');
 }
 
-/**
- * Handle a STAVEN command. Now async for permission checks.
- * @param {object} event - FCA messageCreate event
- * @param {Function} sendFn - async (msg, threadID) => void
- * @param {object} opts - { isBotMsg: boolean, botID: string, checkPerm: Function }
- * @returns {boolean} true if this system handled the command
- */
 export async function handleStavenCommand(event, sendFn, opts = {}) {
   const body = String(event?.body || '').trim();
   const threadID = String(event?.threadID || '');
   const senderID = String(event?.senderID || '');
-  const messageID = String(event?.messageID || '');
 
   if (!body.startsWith('!ستافين')) return false;
 
-  // DM detection for non-bot messages
   if (!opts.isBotMsg) {
     if (!isDM(event, senderID, threadID)) return false;
   }
@@ -214,18 +217,21 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
 
   // ── !ستافين (bare — show help) ─────────────────────
   if (sub === '') {
-    const msg = box('⚡ STAVEN PRIVATE AUTO REPLY V1', [
-      '⚙️ نظام الرد التلقائي',
+    const msg = box('⚡ STAVEN AUTO REPLY V2', [
+      '⚙️ نظام الرسائل المتكررة',
       '',
-      '🔧 الأوامر:',
-      '!ستافين تشغيل — تشغيل النظام',
-      '!ستافين ايقاف — إيقاف النظام',
-      '!ستافين حالة — عرض الحالة',
+      '🔧 طريقة الاستخدام:',
+      '!ستافين تشغيل <النص> <المدة>',
+      '!ستافين ايقاف',
+      '!ستافين حالة',
       '',
-      '📌 ملاحظة:',
-      'هذا النظام يعمل في المحادثات',
-      'الخاصة (DM) فقط.',
-      'يرد فقط على Owner + Admins.',
+      '📌 أمثلة:',
+      '!ستافين تشغيل كك 15ث',
+      '!ستافين تشغيل صباح الخير 1د',
+      '!ستافين تشغيل hello 2س',
+      '',
+      '⏱️ الوحدات المدعومة:',
+      'ث = ثواني | د = دقائق | س = ساعات',
       '',
       '👑 المطور: Magnus',
     ]);
@@ -233,8 +239,9 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
     return true;
   }
 
-  // ── !ستافين تشغيل ──────────────────────────────────
-  if (sub === 'تشغيل') {
+  // ── !ستافين تشغيل <message> <interval> ─────────────
+  if (sub.startsWith('تشغيل')) {
+    const args = sub.slice('تشغيل'.length).trim();
 
     // Permission check — bot owner bypasses
     if (!opts.isBotMsg) {
@@ -248,37 +255,99 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
       }
     }
 
-    // Already active? Don't create duplicate instance
-    if (state[threadID]?.active) {
-      const msg = box('⚡ STAVEN PRIVATE AUTO REPLY V1', [
-        '⚡ النظام يعمل بالفعل',
-        '📍 النوع: محادثة خاصة',
-        '🤖 البوت: Staven Blue V1',
-        '👑 المطور: Magnus',
-        '🟢 الحالة: يعمل',
-        `🆔 Thread ID: ${threadID}`,
+    if (!args) {
+      const msg = box('⚡ STAVEN AUTO REPLY V2', [
+        '❌ يرجى إدخال النص والمدة.',
+        '',
+        '📌 الاستخدام:',
+        '!ستافين تشغيل <النص> <المدة>',
+        '',
+        '📌 أمثلة:',
+        '!ستافين تشغيل كك 15ث',
+        '!ستافين تشغيل صباح الخير 1د',
+        '!ستافين تشغيل hello 2س',
+        '',
+        '⏱️ الوحدات: ث = ثواني | د = دقائق | س = ساعات',
       ]);
       sendFn(msg, threadID).catch(() => {});
       return true;
     }
 
-    // Activate
-    state[threadID] = { active: true };
+    const parts = args.split(/\s+/);
+    let durationStr = '';
+    let messageText = '';
 
-    // Start scheduler only if no timer exists
-    if (!timers[threadID] && _sendFn) {
-      startScheduler(threadID, _sendFn);
+    const lastPart = parts[parts.length - 1];
+    const lastMatch = lastPart.match(/^([\d.]+)(ث|د|س)$/);
+    if (lastMatch) {
+      durationStr = lastPart;
+      messageText = parts.slice(0, -1).join(' ').trim();
+    } else {
+      const msg = box('⚡ STAVEN AUTO REPLY V2', [
+        '❌ المدة غير صحيحة.',
+        '',
+        '⏱️ الوحدات المدعومة:',
+        'ث = ثواني (مثل: 15ث)',
+        'د = دقائق (مثل: 1د, 0.5د)',
+        'س = ساعات (مثل: 2س)',
+        '',
+        '📌 مثال:',
+        '!ستافين تشغيل كك 15ث',
+      ]);
+      sendFn(msg, threadID).catch(() => {});
+      return true;
     }
 
-    saveData().catch(() => {});
+    const intervalMs = parseDuration(durationStr);
+    if (!intervalMs) {
+      const msg = box('⚡ STAVEN AUTO REPLY V2', [
+        '❌ المدة غير صحيحة.',
+        '',
+        '⏱️ الوحدات المدعومة:',
+        'ث = ثواني (مثل: 15ث)',
+        'د = دقائق (مثل: 1د, 0.5د)',
+        'س = ساعات (مثل: 2س)',
+      ]);
+      sendFn(msg, threadID).catch(() => {});
+      return true;
+    }
 
-    const msg = box('⚡ STAVEN PRIVATE AUTO REPLY V1', [
+    if (!messageText) {
+      const msg = box('⚡ STAVEN AUTO REPLY V2', [
+        '❌ يرجى إدخال النص المراد إرساله.',
+        '',
+        '📌 مثال:',
+        '!ستافين تشغيل كك 15ث',
+      ]);
+      sendFn(msg, threadID).catch(() => {});
+      return true;
+    }
+
+    // Stop any existing timer (replace old task)
+    if (timers[threadID]) {
+      stopScheduler(threadID);
+    }
+
+    state[threadID] = { active: true, message: messageText, intervalMs };
+
+    try {
+      await sendFn(messageText, threadID);
+    } catch (err) {
+      console.error(`[STAVEN-PRIVATE] First send failed:`, err?.message);
+    }
+
+    startScheduler(threadID);
+    scheduleSave();
+
+    const msg = box('⚡ STAVEN AUTO REPLY V2', [
       '✅ تم تشغيل النظام بنجاح',
-      '📍 النوع: محادثة خاصة',
+      '',
+      `📝 النص: ${messageText}`,
+      `⏱️ الفاصل: كل ${formatInterval(intervalMs)}`,
+      '⚙️ طبيعة الأمر: إرسال تلقائي متكرر',
+      '',
       '🤖 البوت: Staven Blue V1',
       '👑 المطور: Magnus',
-      '🟢 الحالة: يعمل',
-      `🆔 Thread ID: ${threadID}`,
     ]);
     sendFn(msg, threadID).catch(() => {});
     return true;
@@ -286,8 +355,6 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
 
   // ── !ستافين ايقاف ──────────────────────────────────
   if (sub === 'ايقاف') {
-
-    // Permission check — bot owner bypasses
     if (!opts.isBotMsg) {
       const checkFn = opts.checkPerm || _checkPerm;
       if (checkFn) {
@@ -300,21 +367,16 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
     }
 
     const wasActive = state[threadID]?.active;
-
-    // Complete cleanup
-    state[threadID] = { active: false };
     stopScheduler(threadID);
     delete state[threadID];
+    scheduleSave();
 
-    saveData().catch(() => {});
-
-    const msg = box('⚡ STAVEN PRIVATE AUTO REPLY V1', [
+    const msg = box('⚡ STAVEN AUTO REPLY V2', [
       wasActive ? '🛑 تم إيقاف النظام' : '⚠️ النظام غير نشط حالياً',
-      '📍 النوع: محادثة خاصة',
+      '',
       '🤖 البوت: Staven Blue V1',
       '👑 المطور: Magnus',
       '🔴 الحالة: متوقف',
-      `🆔 Thread ID: ${threadID}`,
     ]);
     sendFn(msg, threadID).catch(() => {});
     return true;
@@ -322,19 +384,20 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
 
   // ── !ستافين حالة ────────────────────────────────────
   if (sub === 'حالة') {
-    const isActive = !!state[threadID]?.active;
-    const msg = box('⚡ STAVEN PRIVATE AUTO REPLY V1', [
-      '📍 النوع: محادثة خاصة',
-      isActive ? '🟢 الحالة: يعمل' : '🔴 الحالة: متوقف',
+    const s = state[threadID];
+    const isActive = !!s?.active;
+    const msg = box('⚡ STAVEN AUTO REPLY V2', [
+      isActive
+        ? `🟢 الحالة: يعمل\n📝 النص: ${s.message}\n⏱️ الفاصل: كل ${formatInterval(s.intervalMs)}`
+        : '🔴 الحالة: متوقف',
+      '',
       '🤖 البوت: Staven Blue V1',
       '👑 المطور: Magnus',
-      `🆔 Thread ID: ${threadID}`,
     ]);
     sendFn(msg, threadID).catch(() => {});
     return true;
   }
 
-  // Not a STAVEN PRIVATE command (e.g., !ستافين شات, !ستافين اضافة ادمن)
   return false;
 }
 
@@ -342,15 +405,9 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
    INITIALIZATION
    ══════════════════════════════════════════════════════════ */
 
-/**
- * Initialize the system: load data, set up permissions, restore active schedulers.
- * @param {Function} sendFn - async (msg, threadID) => void
- * @param {Function} getUserRoleFn - from roles.js (userId => role|null)
- */
 export async function initStavenPrivate(sendFn, getUserRoleFn) {
   _sendFn = sendFn;
 
-  // Set up async permission checker from roles.js
   if (getUserRoleFn) {
     const ROLE_LEVEL = { admin: 1, superAdmin: 2, owner: 3 };
     _checkPerm = async (userId, minLevel) => {
@@ -362,23 +419,22 @@ export async function initStavenPrivate(sendFn, getUserRoleFn) {
 
   await loadData();
 
-  // Restore active schedulers
   let restored = 0;
   for (const [tid, s] of Object.entries(state)) {
     if (s.active && !timers[tid] && _sendFn) {
-      startScheduler(tid, _sendFn);
+      startScheduler(tid);
       restored++;
     }
   }
 
   if (restored > 0) {
-    console.log(`[STAVEN-PRIVATE] Restored ${restored} active DM scheduler(s)`);
+    console.log(`[STAVEN-PRIVATE] Restored ${restored} active scheduler(s)`);
   }
 }
 
-/**
- * Cleanup all timers. Call on bot shutdown.
- */
 export function cleanupStavenPrivate() {
   cleanupAll();
+  for (const tid of Object.keys(state)) {
+    delete state[tid];
+  }
 }
