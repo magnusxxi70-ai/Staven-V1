@@ -7,6 +7,7 @@ const { createMessengerBot } = fca;
 import { hasPermission } from './roles.js';
 import { addUserToStage, commitPendingRoles } from './roles.js';
 import { handleStavenCommand, initStavenPrivate, cleanupStavenPrivate } from './stavenPrivateAutoReply.js';
+import { handleSuperAdminCommand, loadSuperAdmins } from './stavenSuperAdminManager.js';
 
 /* ── Bot Core ─────────────────────────────────────────── */
 
@@ -62,6 +63,9 @@ export async function startBot(appStateArray) {
     const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
     await initStavenPrivate(sendFn);
 
+    // Initialize STAVEN SUPER ADMIN MANAGER
+    await loadSuperAdmins();
+
     bot.on('error', (err) => {
       console.error('[BOT] Error:', err?.message || err);
       botState.status = 'error';
@@ -87,16 +91,23 @@ export async function startBot(appStateArray) {
         if (body.startsWith('!ستافين')) {
           // STAVEN command from bot itself — let it through
           const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
+          const checkPerm = async (uid, level) => hasPermission(uid, level);
+          if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
           if (handleStavenCommand(event, sendFn)) return;
         }
         // All other bot messages: ignore completely (no resume, no command, no loop)
         return;
       }
 
+      // ── STAVEN SUPER ADMIN MANAGER — group/DM commands ─
+      // Handles: !ستافين اضافة ادمن / !ستافين ازالة من ادمن
+      const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
+      const checkPerm = async (uid, level) => hasPermission(uid, level);
+      if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
+
       // ── STAVEN PRIVATE AUTO REPLY — DM commands ───────
       // This handles: !ستافين تشغيل / !ستافين ايقاف / !ستافين حالة / !ستافين (alone in DM)
       // Returns true if it handled the command, false otherwise
-      const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
       if (handleStavenCommand(event, sendFn)) return;
 
       // ── Command handling ──────────────────────────────
