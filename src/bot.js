@@ -2,13 +2,9 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const fca = require('@dongdev/fca-unofficial');
 const { createMessengerBot } = fca;
-import { handleCommand } from './commands.js';
-import { trackBotMessage } from './unsend.js';
-import { trackMessage, canReply } from './chats.js';
-import { onHumanMessage, isAngelActive } from './angel.js';
 
 let bot = null;
-let botApi = null; // exported API context for commands
+let botApi = null;
 
 let botState = {
   status: 'disconnected', // connecting | connected | disconnected | error
@@ -21,7 +17,6 @@ export function getBotState() { return { ...botState }; }
 export function getBotApi() { return botApi; }
 
 export async function startBot(appStateArray) {
-  // Stop existing bot first
   if (bot) { try { await stopBot(); } catch {} }
 
   botState.status = 'connecting';
@@ -43,36 +38,8 @@ export async function startBot(appStateArray) {
     });
 
     bot.on('messageCreate', (event) => {
-      // Use async IIFE to safely handle await inside non-async FCA callback
-      (async () => {
-        try {
-          // Track all messages for chat management
-          trackMessage(event);
-
-          // Check if angel should respond to human messages
-          const threadID = String(event?.threadID || '');
-          if (threadID && event?.senderID && botState.status === 'connected') {
-            const senderID = String(event.senderID);
-            const botID = String(event?.botID || '');
-            const isBot = senderID === '0' || senderID === botID;
-            if (!isBot && isAngelActive(threadID)) {
-              onHumanMessage(threadID, botApi);
-            }
-          }
-
-          // Handle commands
-          const result = handleCommand(event, botApi);
-
-          if (result?.type === 'reply' && threadID) {
-            const msgID = await botApi.sendMessage(result.text, threadID);
-            if (msgID) trackBotMessage(threadID, msgID);
-          }
-          // 'action': command handled its own API calls
-          // 'no_permission'/'cooldown': silently ignore
-        } catch (err) {
-          console.error('[BOT] Message handler error:', err?.message || err);
-        }
-      })();
+      // Message handler — commands removed
+      // Future commands can be added here
     });
 
     botState.status = 'connected';

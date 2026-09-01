@@ -15,9 +15,7 @@ import {
   manualRefresh,
   cleanupRefresh,
 } from './session.js';
-import { protections, redact } from './security.js';
-import {
-  loadRoles,
+import { protections, redact } from './security.js';import { loadRoles,
   getRoles,
   getStagedRoles,
   getUserRole,
@@ -28,9 +26,6 @@ import {
   commitPendingRoles,
   discardPendingRoles,
 } from './roles.js';
-import { loadAdminLevels } from './admin.js';
-import { loadAngelState, cleanupAngels } from './angel.js';
-import { loadChatsState } from './chats.js';
 
 process.on('uncaughtException', e => console.error('[STAVEN BLUE V1]', redact(e?.message || e)));
 process.on('unhandledRejection', e => console.error('[STAVEN BLUE V1]', redact(e?.message || e)));
@@ -793,10 +788,7 @@ loadRoles();
 /* ── Start ───────────────────────────────────────────────── */
 
 await loadRoles();
-await loadAdminLevels();
-await loadChatsState();
 await loadSessionState();
-await loadAngelState();
 
 const port = Number(process.env.PORT || config.port || 3000);
 const host = '0.0.0.0';
@@ -808,7 +800,6 @@ app.listen(port, host, () => {
 function shutdown(signal) {
   console.log(`[STAVEN BLUE V1] ${signal} received, shutting down`);
   cleanupRefresh();
-  cleanupAngels();
   process.exit(0);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
