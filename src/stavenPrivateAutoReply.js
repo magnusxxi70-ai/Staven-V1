@@ -143,9 +143,14 @@ export function handleStavenCommand(event, sendFn) {
 
   const sub = body.slice('!ستافين'.length).trim();
 
-  // ── DM detection: threadID === senderID means private DM ──
-  const isGroup = event?.isGroup === true || event?.threadType === 'group' || (threadID !== senderID && senderID !== '0');
-  if (isGroup) return false; // let group handler deal with it
+  // ── DM detection ──
+  // Self-messages (bot's own account, senderID === '0') from bot.js are
+  // already validated as STAVEN commands — allow them unconditionally.
+  const isSelfMsg = senderID === '0';
+  if (!isSelfMsg) {
+    const isGroup = event?.isGroup === true || event?.threadType === 'group' || (threadID !== senderID && senderID !== '0');
+    if (isGroup) return false; // let group handler deal with it
+  }
 
   // ── !ستافين تشغيل ──────────────────────────────────
   if (sub === 'تشغيل' || sub === '') {

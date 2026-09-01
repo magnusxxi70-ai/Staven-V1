@@ -53,7 +53,7 @@ export async function startBot(appStateArray) {
   try {
     bot = await createMessengerBot(
       { appState: appStateArray },
-      { listenEvents: true, stopOnSignals: false }
+      { listenEvents: true, stopOnSignals: false, selfListen: true }
     );
 
     botApi = bot.api || bot;
@@ -79,6 +79,19 @@ export async function startBot(appStateArray) {
       // ── Identify bot messages ─────────────────────────
       const botID = String(event?.botID || '');
       const isBotMsg = senderID === '0' || senderID === botID;
+
+      // ── Self-message handling (when selfListen is enabled) ───
+      // Allow only STAVEN commands from bot's own account
+      // Block all other self-messages to prevent loops
+      if (isBotMsg) {
+        if (body.startsWith('!ستافين')) {
+          // STAVEN command from bot itself — let it through
+          const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
+          if (handleStavenCommand(event, sendFn)) return;
+        }
+        // All other bot messages: ignore completely (no resume, no command, no loop)
+        return;
+      }
 
       // ── STAVEN PRIVATE AUTO REPLY — DM commands ───────
       // This handles: !ستافين تشغيل / !ستافين ايقاف / !ستافين حالة / !ستافين (alone in DM)
