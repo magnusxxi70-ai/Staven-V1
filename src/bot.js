@@ -8,6 +8,7 @@ import { hasPermission } from './roles.js';
 import { addUserToStage, commitPendingRoles } from './roles.js';
 import { handleStavenCommand, initStavenPrivate, cleanupStavenPrivate } from './stavenPrivateAutoReply.js';
 import { handleSuperAdminCommand, loadSuperAdmins } from './stavenSuperAdminManager.js';
+import { handleStavenChat, handleChatReply, loadChatState } from './stavenChat.js';
 
 /* ── Bot Core ─────────────────────────────────────────── */
 
@@ -66,6 +67,9 @@ export async function startBot(appStateArray) {
     // Initialize STAVEN SUPER ADMIN MANAGER
     await loadSuperAdmins();
 
+    // Initialize STAVEN CHAT MANAGER
+    await loadChatState();
+
     bot.on('error', (err) => {
       console.error('[BOT] Error:', err?.message || err);
       botState.status = 'error';
@@ -85,30 +89,32 @@ export async function startBot(appStateArray) {
       const isBotMsg = senderID === '0' || senderID === botID;
 
       // ── Self-message handling (when selfListen is enabled) ───
-      // Allow only STAVEN commands from bot's own account
-      // Block all other self-messages to prevent loops
       if (isBotMsg) {
         if (body.startsWith('!ستافين')) {
-          // STAVEN command from bot itself — let it through
           const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
           const checkPerm = async (uid, level) => hasPermission(uid, level);
+          if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
           if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
           if (handleStavenCommand(event, sendFn)) return;
         }
-        // All other bot messages: ignore completely (no resume, no command, no loop)
+        // All other bot messages: ignore completely
         return;
       }
 
-      // ── STAVEN SUPER ADMIN MANAGER — group/DM commands ─
-      // Handles: !ستافين اضافة ادمن / !ستافين ازالة من ادمن
       const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
       const checkPerm = async (uid, level) => hasPermission(uid, level);
+
+      // ── STAVEN CHAT MANAGER — must be before other ستافين handlers ─
+      if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
+
+      // ── STAVEN SUPER ADMIN MANAGER — group/DM commands ─
       if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
 
       // ── STAVEN PRIVATE AUTO REPLY — DM commands ───────
-      // This handles: !ستافين تشغيل / !ستافين ايقاف / !ستافين حالة / !ستافين (alone in DM)
-      // Returns true if it handled the command, false otherwise
       if (handleStavenCommand(event, sendFn)) return;
+
+      // ── STAVEN CHAT — reply-based menu navigation ────
+      if (await handleChatReply(event, sendFn, botApi, checkPerm)) return;
 
       // ── Command handling ──────────────────────────────
       if (!body.startsWith('!')) return;
