@@ -74,8 +74,9 @@ export async function startBot(appStateArray) {
     } catch {}
     const botID = cachedBotID;
 
-    // Initialize STAVEN PRIVATE AUTO REPLY (DM system)
-    // Pass getUserRole from roles.js so STAVEN can check permissions
+    console.log(`[BOT] Bot ID: ${botID || '(unknown)'}`);
+
+    // Initialize STAVEN PRIVATE AUTO REPLY
     const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
     await initStavenPrivate(sendFn, getUserRole);
 
@@ -106,53 +107,51 @@ export async function startBot(appStateArray) {
       if (messageID) markMessageProcessed(messageID);
 
       // ════════════════════════════════════════════════════════
-      // BOT MESSAGE HANDLING (selfListen: true)
+      // IDENTIFY MESSAGE SOURCE
       // ════════════════════════════════════════════════════════
       const isBotMsg = senderID === '0' || senderID === botID;
 
+      const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
+      const checkPerm = async (uid, level) => {
+        if (botID && uid === botID) return true;
+        return hasPermission(uid, level);
+      };
+
+      // ════════════════════════════════════════════════════════
+      // BOT MESSAGE HANDLING (selfListen: true)
+      // ════════════════════════════════════════════════════════
       if (isBotMsg) {
-        // For self-messages, check STAVEN commands only
+        // Bot's own messages: only handle STAVEN commands, ignore everything else
+        // This prevents loops from auto-reply messages
         if (body.startsWith('!ستافين')) {
-          const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
           if (await handleStavenCommand(event, sendFn, { isBotMsg: true, botID })) return;
-          if (await handleStavenChat(event, sendFn, botApi, async (uid, lvl) => hasPermission(uid, lvl))) return;
-          if (await handleSuperAdminCommand(event, sendFn, async (uid, lvl) => hasPermission(uid, lvl))) return;
+          if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
+          if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
         }
-        // All other bot messages: ignore completely (prevent loops)
+        // All other bot messages (including auto-reply output) → ignore
         return;
       }
 
       // ════════════════════════════════════════════════════════
       // HUMAN MESSAGE HANDLING
       // ════════════════════════════════════════════════════════
-      const sendFn = async (msg, tid) => { await botApi.sendMessage(msg, tid); };
 
-      // Permission check: bot owner always passes, others go through roles.js
-      const checkPerm = async (uid, level) => {
-        if (botID && uid === botID) return true; // Bot owner bypass
-        return hasPermission(uid, level);
-      };
+      // 1. Try STAVEN COMMANDS first (highest priority for !ستافين)
+      if (body.startsWith('!ستافين')) {
+        if (await handleStavenCommand(event, sendFn, { isBotMsg: false, botID })) return;
+        if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
+        if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
+      }
 
-      // ── STAVEN CHAT MANAGER — must be before other ستافين handlers ─
-      if (await handleStavenChat(event, sendFn, botApi, checkPerm)) return;
-
-      // ── STAVEN SUPER ADMIN MANAGER — group/DM commands ─
-      if (await handleSuperAdminCommand(event, sendFn, checkPerm)) return;
-
-      // ── STAVEN PRIVATE AUTO REPLY — DM commands ───────
-      // Only allow Owner/Admins to use STAVEN commands
-      if (await handleStavenCommand(event, sendFn, { isBotMsg: false, botID, checkPerm })) return;
-
-      // ── STAVEN CHAT — reply-based menu navigation ────
+      // 2. Try STAVEN CHAT reply-based menu navigation (no prefix required)
       if (await handleChatReply(event, sendFn, botApi, checkPerm)) return;
 
-      // ── Command handling ──────────────────────────────
+      // 3. Try other commands
       if (!body.startsWith('!')) return;
 
       // ── !uptime ──────────────────────────────────────
       const cmd = body.split(/\s+/)[0].toLowerCase();
       if (cmd === '!uptime') {
-        // Permission check for uptime
         if (!await checkPerm(senderID, 'admin')) return;
 
         const totalSec = Math.floor(process.uptime());

@@ -7,14 +7,9 @@
  * Bot: Staven Blue V1
  * ══════════════════════════════════════════════════════════
  *
- * Independent auto-reply system with custom messages and intervals.
- * - Custom message + custom interval (ث/د/س)
- * - Continuous sending (NO auto-stop — runs until !ستافين ايقاف)
- * - Per-thread independent state
- * - Persistent across restarts
- * - Permission-gated: only Owner + Admins
- * - Single instance per thread (no duplicates)
- * - Commands: !ستافين / !ستافين تشغيل / !ستافين ايقاف / !ستافين حالة
+ * Auto-reply system with custom messages and intervals.
+ * Works in DMs and groups.
+ * Commands: !ستافين / !ستافين تشغيل / !ستافين ايقاف / !ستافين حالة
  */
 
 import fs from 'node:fs/promises';
@@ -53,7 +48,7 @@ export function markMessageProcessed(messageID) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   PERMISSION CHECK
+   PERMISSION CHECK (optional — for future use)
    ══════════════════════════════════════════════════════════ */
 
 let _checkPerm = null;
@@ -183,17 +178,6 @@ function cleanupAll() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   DM DETECTION
-   ══════════════════════════════════════════════════════════ */
-
-function isDM(event, senderID, threadID) {
-  if (event?.isGroup === true) return false;
-  if (event?.threadType === 'group') return false;
-  if (senderID === '0') return true;
-  return threadID === senderID;
-}
-
-/* ══════════════════════════════════════════════════════════
    COMMAND HANDLER
    ══════════════════════════════════════════════════════════ */
 
@@ -202,6 +186,13 @@ function box(title, lines) {
   return [`╭${bar}╮`, `│ ${title}`, '│', ...lines, `╰${bar}╯`].join('\n');
 }
 
+/**
+ * Handle a STAVEN command.
+ * @param {object} event - FCA messageCreate event
+ * @param {Function} sendFn - async (msg, threadID) => void
+ * @param {object} opts - { isBotMsg: boolean, botID: string }
+ * @returns {boolean} true if handled
+ */
 export async function handleStavenCommand(event, sendFn, opts = {}) {
   const body = String(event?.body || '').trim();
   const threadID = String(event?.threadID || '');
@@ -209,11 +200,9 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
 
   if (!body.startsWith('!ستافين')) return false;
 
-  if (!opts.isBotMsg) {
-    if (!isDM(event, senderID, threadID)) return false;
-  }
-
   const sub = body.slice('!ستافين'.length).trim();
+
+  console.log(`[STAVEN-CMD] body="${body}" sub="${sub}" thread=${threadID} sender=${senderID} isBot=${opts.isBotMsg}`);
 
   // ── !ستافين (bare — show help) ─────────────────────
   if (sub === '') {
@@ -243,15 +232,13 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
   if (sub.startsWith('تشغيل')) {
     const args = sub.slice('تشغيل'.length).trim();
 
-    // Permission check — bot owner bypasses
-    if (!opts.isBotMsg) {
-      const checkFn = opts.checkPerm || _checkPerm;
-      if (checkFn) {
-        const allowed = await checkFn(senderID, 'admin');
-        if (!allowed) {
-          sendFn('❌ هذا الأمر متاح فقط لـ Owner / Admin.', threadID).catch(() => {});
-          return true;
-        }
+    // Permission check (bot owner always passes, configured users pass)
+    // opts.allowAll = true skips permission check entirely
+    if (!opts.isBotMsg && !opts.allowAll && _checkPerm) {
+      const allowed = await _checkPerm(senderID, 'admin');
+      if (!allowed) {
+        sendFn('❌ هذا الأمر متاح فقط لـ Owner / Admin.', threadID).catch(() => {});
+        return true;
       }
     }
 
@@ -325,19 +312,25 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
 
     // Stop any existing timer (replace old task)
     if (timers[threadID]) {
+      console.log(`[STAVEN-PRIVATE] Stopping existing timer for ${threadID}`);
       stopScheduler(threadID);
     }
 
     state[threadID] = { active: true, message: messageText, intervalMs };
 
+    // Send first message immediately
+    console.log(`[STAVEN-PRIVATE] Sending first message: "${messageText}" to ${threadID}`);
     try {
       await sendFn(messageText, threadID);
+      console.log(`[STAVEN-PRIVATE] First message sent successfully`);
     } catch (err) {
       console.error(`[STAVEN-PRIVATE] First send failed:`, err?.message);
     }
 
     startScheduler(threadID);
     scheduleSave();
+
+    console.log(`[STAVEN-PRIVATE] Scheduler started: interval=${intervalMs}ms`);
 
     const msg = box('⚡ STAVEN AUTO REPLY V2', [
       '✅ تم تشغيل النظام بنجاح',
@@ -355,14 +348,11 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
 
   // ── !ستافين ايقاف ──────────────────────────────────
   if (sub === 'ايقاف') {
-    if (!opts.isBotMsg) {
-      const checkFn = opts.checkPerm || _checkPerm;
-      if (checkFn) {
-        const allowed = await checkFn(senderID, 'admin');
-        if (!allowed) {
-          sendFn('❌ هذا الأمر متاح فقط لـ Owner / Admin.', threadID).catch(() => {});
-          return true;
-        }
+    if (!opts.isBotMsg && !opts.allowAll && _checkPerm) {
+      const allowed = await _checkPerm(senderID, 'admin');
+      if (!allowed) {
+        sendFn('❌ هذا الأمر متاح فقط لـ Owner / Admin.', threadID).catch(() => {});
+        return true;
       }
     }
 
@@ -370,6 +360,8 @@ export async function handleStavenCommand(event, sendFn, opts = {}) {
     stopScheduler(threadID);
     delete state[threadID];
     scheduleSave();
+
+    console.log(`[STAVEN-PRIVATE] Stopped for ${threadID} (was active: ${wasActive})`);
 
     const msg = box('⚡ STAVEN AUTO REPLY V2', [
       wasActive ? '🛑 تم إيقاف النظام' : '⚠️ النظام غير نشط حالياً',
